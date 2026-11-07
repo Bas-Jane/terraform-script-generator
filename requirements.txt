@@ -1,0 +1,2 @@
+# Core converter uses Python standard library only (Python >= 3.10).
+# Tkinter is supplied by your operating system / Python installer, not pip.

@@ -1,0 +1,4 @@
+Terraform Script Generator
+Edition: GitHub_No_Workflow
+Version: 2026.11.07.3
+No GitHub Actions/workflows.
