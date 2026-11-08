@@ -298,59 +298,72 @@ def find_vertical_target_values(section, prm):
   if rec:tables.append((rn,rec))
  return tables
 
-def find_horizontal_target_values(section, prm):
- """Read repeated records in CIQ side-by-side Target/Current grids.
+def declared_section_leaves(section, prm):
+ """Extract declared leaf names from the PARAMATERS matrix, including bare names.
 
- A verified Target Values heading must be followed by leaf header cells.
- Select the first occurrence of each declared leaf, stopping before the
- duplicate Current Values group. Never infer values from description rows.
+ Only a row with a recognized Type cell may declare a leaf. This avoids
+ confusing narrative text, column hints or Target/Current headings with leaves.
  """
  declared=[]
- for rn,row in section:
+ for rn, row in section:
   if rn<=prm:continue
   if any(re.search(r"\bTarget Values\s*\(",str(v),re.I) for v in row.values()):break
   key=str(row.get(2,'')).strip()
-  if is_parameter_name(key):declared.append(clean_name(key))
+  typ=str(row.get(3,'')).strip().lower()
+  if not re.search(r"\b(?:key\s+leaf|leaf|child\s+list|leaf-list)\b",typ):continue
+  # Bare YANG names such as pod, prefix, gateway and distance are legal.
+  if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.:-]*(?:\s*/\s*[A-Za-z][A-Za-z0-9_.:-]*)*",key):continue
+  norm=clean_name(re.sub(r"\s*/\s*",'/',key))
+  if norm and norm not in declared:declared.append(norm)
+ return declared
+
+def find_horizontal_target_values(section, prm):
+ """Read multi-row target grids using the declared parameter/leaf schema.
+
+ The Target Values heading defines the left grid; Current Values defines the
+ exclusive right boundary. Sparse columns, spacer columns, review symbols and
+ human notes are ignored. Every populated row is a separate record.
+ """
+ declared=declared_section_leaves(section,prm)
+ if len(declared)<2:return []
  known=set(declared)
- if len(known)<2:return []
  results=[]
  for idx,(rn,row) in enumerate(section):
   target_starts=[c for c,v in sorted(row.items()) if re.search(r"\bTarget Values\s*\(",str(v),re.I)]
   if rn<=prm or not target_starts:continue
-  # Header must be the next nonempty row, and contain multiple declared leaves.
-  header_at=None;columns=[]
-  for j in range(idx+1,min(idx+5,len(section))):
+  target_start=min(target_starts)
+  current_starts=[c for c,v in sorted(row.items()) if re.search(r"\bCurrent Values\s*\(",str(v),re.I)]
+  current_start=min((c for c in current_starts if c>target_start),default=10000)
+  header_at=None; columns=[]
+  for j in range(idx+1,min(idx+6,len(section))):
    hr,head=section[j]
-   if hr>rn+4:break
-   candidates=[(c,clean_name(v)) for c,v in sorted(head.items())
-               if is_parameter_name(v) and clean_name(v) in known and c>=min(target_starts)]
-   if len(candidates)<2:continue
-   chosen=[];seen=set()
-   for col,key in candidates:
-    # Current Values repeats the same headings to the right.
-    if key in seen:break
-    seen.add(key);chosen.append((col,key))
-   if len(chosen)>=2:
-    header_at=j;columns=chosen;break
+   if hr>rn+5:break
+   candidates=[];seen=set()
+   for col,value in sorted(head.items()):
+    if not target_start<=col<current_start:continue
+    key=clean_name(re.sub(r"\s*/\s*",'/',str(value).strip()))
+    if key in known and key not in seen:
+     candidates.append((col,key));seen.add(key)
+   if len(candidates)>=2:
+    header_at=j; columns=candidates;break
   if header_at is None:continue
   records=[];blank=0
+  colset={c for c,_ in columns}
   for rr,values in section[header_at+1:]:
-   if rr>section[header_at][0]+500:break
+   if rr>section[header_at][0]+5000:break
    if any(re.search(r"\b(?:Target Values\s*\(|Current Values\s*\(|PARAMATERS|PARAMETERS|YANG\s*Path\s*:)",str(v),re.I) for v in values.values()):break
-   # Stop at the next repeated parameter header, not a row containing real data.
-   if sum(clean_name(v) in known and is_parameter_name(v) for c,v in values.items() if c in {c for c,_ in columns})>=2:break
+   if sum(clean_name(values.get(c,'')) in known for c in colset)>=2:break
    record={}
    for col,key in columns:
     val=normalize(values.get(col))
     if val is not None:record[key]=val
-   if not record:
+   # A valid record needs its first/key leaf; avoids standalone notes.
+   if not record or columns[0][1] not in record:
     blank+=1
     if records and blank>=2:break
     continue
+   records.append({key:record[key] for key in declared if key in record})
    blank=0
-   # A record must include its first/key leaf; otherwise it is likely a note.
-   if columns[0][1] not in record:continue
-   records.append(record)
   if records:results.append((rn,records))
  return results
 
@@ -455,7 +468,7 @@ def collect_section_metadata(rows):
     metadata[state]+=('\n' if metadata[state] else '')+first
    elif state=='parameters':
     leaf=row.get(2,'')
-    if is_parameter_name(leaf):
+    if (is_parameter_name(leaf) or (re.fullmatch(r'[A-Za-z][A-Za-z0-9_.:-]*',str(leaf).strip()) and re.search(r'\b(?:key\s+leaf|leaf|leaf-list|child\s+list)\b',str(row.get(3,'')).lower()))):
      key=clean_name(leaf)
      if key not in metadata['parameter_order']:metadata['parameter_order'].append(key)
      if '/' in str(leaf):
