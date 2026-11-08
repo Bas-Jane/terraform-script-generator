@@ -294,6 +294,23 @@ def convert_sheet_sparse(name,rows):
   else:warnings.append(f'{path}: no target values found')
  return data,warnings
 
+def is_supplementary_details_row(row):
+ """Detect narrative reference tables after Target Values, irrespective of NF name.
+
+ E.g. 'MME NAS Timer Details' / 'Details hidden' followed by
+ 'Timers (nas-timer-mme-tid)' / 'Description'.
+ """
+ cells=[str(v).strip() for _,v in sorted(row.items()) if v is not None and str(v).strip()]
+ if not cells:return False
+ first=re.sub(r"\s+"," ",cells[0]).strip()
+ second=re.sub(r"\s+"," ",cells[1]).strip() if len(cells)>1 else ""
+ if re.search(r"(?i)\bdetails\s+hidden\b", first+" "+second):return True
+ if re.search(r"(?i)\bdetails\s*$",first) and len(first.split())>=2:return True
+ if re.match(r"(?i)^(?:timers?|parameters?|entries|items)\s*\([^)]*\)\s*$",first) and (
+     re.match(r"(?i)^(?:description|details|value\s+range|type)\b",second) or len(cells)>=3):return True
+ return False
+
+
 def find_vertical_target_values(section, prm):
  """Extract each repeated Target Values (A2C3) key/value block.
 
@@ -315,6 +332,7 @@ def find_vertical_target_values(section, prm):
   rec={}
   for rr,values in section[pos+1:]:
    if rr>rn+500:break
+   if is_supplementary_details_row(values):break
    if any(re.search(r"\b(?:Target Values\s*\(|PARAMATERS|PARAMETERS|YANG\s*Path\s*:)",str(v),re.I) for v in values.values()):break
    raw_key=re.sub(r"\s*/\s*",'/',str(values.get(keycol,'')).strip())
    key=clean_name(raw_key)
@@ -381,10 +399,18 @@ def find_horizontal_target_values(section, prm):
   if header_at is None:continue
   records=[];blank=0
   colset={c for c,_ in columns}
+  previous_row=section[header_at][0]
   for rr,values in section[header_at+1:]:
    if rr>section[header_at][0]+5000:break
+   # Empty Excel rows are not included in the sparse row iterator.  A gap
+   # *after* valid target records terminates this target table.  Otherwise
+   # the following explanatory/reference table can be mistaken for data.
+   if records and rr>previous_row+1:break
+   previous_row=rr
    if any(re.search(r"\b(?:Target Values\s*\(|Current Values\s*\(|PARAMATERS|PARAMETERS|YANG\s*Path\s*:)",str(v),re.I) for v in values.values()):break
    if sum(clean_name(values.get(c,'')) in known for c in colset)>=2:break
+   # Stop at the first supplementary details/reference table.
+   if is_supplementary_details_row(values):break
    record={}
    for col,key in columns:
     val=normalize(values.get(col))
@@ -392,7 +418,7 @@ def find_horizontal_target_values(section, prm):
    # A valid record needs its first/key leaf; avoids standalone notes.
    if not record or columns[0][1] not in record:
     blank+=1
-    if records and blank>=2:break
+    if records and blank>=1:break
     continue
    records.append({key:record[key] for key in declared if key in record})
    blank=0
@@ -608,6 +634,7 @@ def extract_reference_grid(rows, wanted_keys, warnings, sheet_name):
   records=[]
   for rr,vals in rows[ix+1:]:
    if rr>rn+100000:break
+   if is_supplementary_details_row(vals):break
    if any(re.search(r'\b(?:Target Values\s*\(|PARAMATERS|PARAMETERS|YANG\s*Path\s*:)',str(v),re.I) for v in vals.values()):break
    rec={key:normalize(vals.get(col)) for col,key in header if normalize(vals.get(col)) is not None}
    if all(k in rec for k in required) and len(rec)>=2:
