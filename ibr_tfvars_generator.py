@@ -541,6 +541,34 @@ def referenced_sheet(value):
 def _sheet_token(value):
  return re.sub(r"[^a-z0-9]+", "", str(value).casefold())
 
+def section_level_sheet_references(rows):
+ """Find a CIQ section's external target worksheet without reading other sections.
+
+ References can be on a Review Status heading or after the leaf definitions.
+ The next Review Status row closes the current section even before the next
+ YANG Path, preventing a later section's pointer from being misassigned.
+ """
+ paths=[rn for rn,row in rows if any(re.search(r"YANG\s*Path\s*:",str(v),re.I) for v in row.values())]
+ found={}
+ for i,start in enumerate(paths):
+  prev=paths[i-1] if i else 0
+  next_path=paths[i+1] if i+1<len(paths) else (rows[-1][0]+1 if rows else start+1)
+  next_header=next((rn for rn,row in rows if start<rn<next_path and
+    any(re.search(r"Review\s*Status",str(v),re.I) for v in row.values())),next_path)
+  # Own preamble starts at nearest Review Status preceding this YANG Path.
+  header=next((rn for rn,row in reversed(rows) if prev<rn<start and
+    any(re.search(r"Review\s*Status",str(v),re.I) for v in row.values())),start)
+  candidates=[]
+  for rn,row in rows:
+   if header<=rn<next_header:
+    for value in row.values():
+     target=referenced_sheet(value)
+     if target:candidates.append(target)
+  unique={_sheet_token(t):t for t in candidates}
+  if len(unique)==1:found[start]=next(iter(unique.values()))
+  elif len(unique)>1:found[start]=list(unique.values())
+ return found
+
 def extract_reference_grid(rows, wanted_keys, warnings, sheet_name):
  """Parse target-only grids, including wide tables with a repeated Current Values header.
 
@@ -662,6 +690,21 @@ def discover(workbook):
    blocks,extra=discover_key_value_table(sheet,rows)
    warnings=extra if blocks else warnings+extra
   metadata=collect_section_metadata(rows)
+  section_refs=section_level_sheet_references(rows)
+  # Sections with only "See value below" in their leaf definition table have
+  # no local target records. Represent them as pending cross-sheet resolutions.
+  found={(path,rn) for _,_,path,rn in blocks}
+  for (path,rn),meta in metadata.items():
+   if (path,rn) in found or section_is_out_of_scope(rows,rn):continue
+   ref=section_refs.get(rn)
+   if not isinstance(ref,str):
+    if isinstance(ref,list):warnings.append(f"{path}: ambiguous sheet pointers: {ref}")
+    continue
+   order=meta.get('parameter_order',[])
+   if not order:
+    warnings.append(f"{path}: no declared leaves for referenced worksheet '{ref}'")
+    continue
+   blocks.append((clean_name(path.rstrip('/').split('/')[-1]),[{order[0]:f'Refer to {ref} sheet'}],path,rn))
   for leaf,entries,path,rn in blocks:
    # Defense in depth: never put a skipped CIQ section in the catalog.
    if path != 'direct table' and section_is_out_of_scope(rows,rn):
