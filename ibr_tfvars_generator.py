@@ -372,10 +372,24 @@ def find_horizontal_target_values(section, prm):
  return results
 
 def convert_sheet(name,rows):
- """Prefer explicit vertical target-value blocks over description-matrix placeholders.
-
- Other established CIQ layouts continue using the legacy/sparse parsers.
- """
+ """Prefer verified target blocks over fallback/description-matrix placeholders."""
+ # For standalone sheets, reject a duplicated Current Values grid and extract
+ # ALL records from the leftmost set of header columns (not merely the rows
+ # where both left and right tables happen to be populated).
+ if rows and not any(any('YANG Path:' in str(v) for v in row.values()) for _,row in rows):
+  for rn,header in rows[:35]:
+   seen=set();columns=[];has_duplicate=False
+   for col,value in sorted(header.items()):
+    key=clean_name(re.sub(r'\s*/\s*','/',str(value).strip()))
+    if key in seen and len(columns)>=2:
+     has_duplicate=True;break
+    if is_parameter_name(value) and col>=2:
+     columns.append(key);seen.add(key)
+   if has_duplicate and len(columns)>=2:
+    notes=[]
+    records=extract_reference_grid(rows,columns,notes,name)
+    if records:
+     return [(clean_name(name),records,'direct table',rn)], notes
  baseline,base_warnings=convert_sheet_legacy(name,rows)
  upgraded,_=convert_sheet_sparse(name,rows)
  old_map={(path,rn):i for i,(_,_,path,rn) in enumerate(baseline)}
@@ -455,7 +469,7 @@ def collect_section_metadata(rows):
  for i,(start,path) in enumerate(paths):
   end=paths[i+1][0] if i+1<len(paths) else (rows[-1][0]+1 if rows else start+1)
   section=[(rn,row) for rn,row in rows if start<=rn<end]
-  metadata={'yang_path':path,'cli_command':'','description':'','dependencies':'','parameter_order':[],'child_paths':{}}
+  metadata={'yang_path':path,'cli_command':'','description':'','dependencies':'','parameter_order':[],'child_paths':{},'string_leaves':[]}
   state=None
   for rn,row in section:
    values=[str(v).strip() for _,v in sorted(row.items()) if str(v).strip()]
@@ -475,6 +489,9 @@ def collect_section_metadata(rows):
     if (is_parameter_name(leaf) or (re.fullmatch(r'[A-Za-z][A-Za-z0-9_.:-]*',str(leaf).strip()) and re.search(r'\b(?:key\s+leaf|leaf|leaf-list|child\s+list)\b',str(row.get(3,'')).lower()))):
      key=clean_name(leaf)
      if key not in metadata['parameter_order']:metadata['parameter_order'].append(key)
+     definition=str(row.get(7,'')).lower().replace('_x000d_', '\n')
+     if re.search(r'\btype\s*:\s*(?:string\b|[^\n]*,\s*string\b)',definition) and key not in metadata['string_leaves']:
+      metadata['string_leaves'].append(key)
      if '/' in str(leaf):
       parts=[clean_name(part.strip()) for part in str(leaf).split('/') if part.strip()]
       if len(parts)==2:metadata['child_paths'][key]=parts
@@ -490,9 +507,96 @@ def reorder_entries(entries,leaf_order):
                  {key:value for key,value in entry.items() if key not in leaf_order})
  return ordered
 
+# Cross-sheet reference resolution is intentionally schema-driven; no PLMN-specific
+# value lists or leaf names are hardcoded here.
+SHEET_REFERENCE = re.compile(r"(?:=+>\s*)?refer\s+to\s+(.+?)\s+sheet\.?\s*$", re.I)
+
+def referenced_sheet(value):
+ if not isinstance(value,str):return None
+ match=SHEET_REFERENCE.search(value.strip())
+ return match.group(1).strip(" .\t\"'") if match else None
+
+def _sheet_token(value):
+ return re.sub(r"[^a-z0-9]+", "", str(value).casefold())
+
+def extract_reference_grid(rows, wanted_keys, warnings, sheet_name):
+ """Parse target-only grids, including wide tables with a repeated Current Values header.
+
+ Parameters are determined by the referring section's YANG leaf definitions.
+ Repeated header names mark the end of the first/Target Values grid; read
+ none of the current/review columns. A row is a record only if its key leaves
+ are populated, preventing blank notes from becoming objects.
+ """
+ from difflib import get_close_matches
+ known=set(wanted_keys)
+ options=[]
+ for ix,(rn,row) in enumerate(rows):
+  header=[];used=set()
+  for col,value in sorted(row.items()):
+   key=clean_name(re.sub(r"\s*/\s*", "/",str(value).strip()))
+   if key in used:break  # duplicate means second (Current Values) grid
+   if key in known:
+    header.append((col,key));used.add(key)
+   elif key not in known and '_' in key:
+    # Only accept a unique one-character typo in an otherwise matching header;
+    # record it in manifest warnings for manual validation.
+    close=get_close_matches(key,list(known-used),n=2,cutoff=0.9)
+    if len(close)==1 and abs(len(close[0])-len(key))<=1 and key.split('_')[0]==close[0].split('_')[0]:
+     header.append((col,close[0]));used.add(close[0])
+     warnings.append(f'{sheet_name}: mapped header {key} to declared {close[0]}')
+  # A plausible grid must contain at least 2 declared columns, including
+  # its first two key leaves where such keys are declared.
+  required=wanted_keys[:1]  # remaining key leafs may be explicitly [ENC]
+  if len(header)<2 or not all(k in used for k in required):continue
+  records=[]
+  for rr,vals in rows[ix+1:]:
+   if rr>rn+100000:break
+   if any(re.search(r'\b(?:Target Values\s*\(|PARAMATERS|PARAMETERS|YANG\s*Path\s*:)',str(v),re.I) for v in vals.values()):break
+   rec={key:normalize(vals.get(col)) for col,key in header if normalize(vals.get(col)) is not None}
+   if all(k in rec for k in required) and len(rec)>=2:
+    records.append({k:rec[k] for k in wanted_keys if k in rec})
+   elif records and not any(vals.get(col) for col,_ in header):break
+  if records:options.append((len(used),len(records),-header[0][0],records))
+ if not options:return []
+ # First maximize field coverage, then records, then prefer leftmost grid.
+ return max(options,key=lambda x:x[:3])[3]
+
+def resolve_sheet_references(catalog, sheet_rows, warnings):
+ """Follow full-sheet `Refer to ... sheet` pointers without emitting them as values.
+
+ Do not guess when an exact named worksheet is absent. Unresolved references
+ are excluded from generated assignments and recorded as warnings.
+ """
+ by_name={_sheet_token(name):(name,rows) for name,rows in sheet_rows.items()}
+ for block in catalog:
+  entries=block['entries']
+  pointers={referenced_sheet(v) for record in entries for v in record.values() if referenced_sheet(v)}
+  if not pointers:continue
+  if len(pointers)!=1:
+   warnings.append(f"{block['sheet']} / {block['config']}: ambiguous referenced sheets: {sorted(pointers)}")
+   block['entries']=[{k:v for k,v in r.items() if referenced_sheet(v) is None} for r in entries]
+   continue
+  target=next(iter(pointers));hit=by_name.get(_sheet_token(target))
+  if hit is None:
+   warnings.append(f"{block['sheet']} / {block['config']}: referenced worksheet '{target}' not found")
+   block['entries']=[{k:v for k,v in r.items() if referenced_sheet(v) is None} for r in entries]
+   continue
+  target_name,raw_rows=hit
+  declared=block.get('metadata',{}).get('parameter_order') or list(dict.fromkeys(k for r in entries for k in r))
+  grid=extract_reference_grid(raw_rows,declared,warnings,target_name)
+  if not grid:
+   warnings.append(f"{block['sheet']} / {block['config']}: no matching target table found in '{target_name}'")
+   block['entries']=[{k:v for k,v in r.items() if referenced_sheet(v) is None} for r in entries]
+   continue
+  block['entries']=grid
+  block['reference_sheet']=target_name
+  # Keep the original YANG metadata and canonical variable name.
+ return catalog
+
 def discover(workbook):
- catalog=[]; errors=[]; sheets=[]
+ catalog=[]; errors=[]; sheets=[]; sheet_rows={}
  for sheet,rows in read_workbook(workbook):
+  sheet_rows[sheet]=rows
   sheets.append(sheet)
   blocks,warnings=convert_sheet(sheet,rows)
   if not blocks:
@@ -504,6 +608,8 @@ def discover(workbook):
    entries=reorder_entries(entries,meta.get('parameter_order',[]))
    catalog.append({'sheet':sheet,'config':clean_name(leaf),'entries':entries,'path':path,'row':rn,'metadata':meta})
   errors.extend(f'{sheet}: {w}' for w in warnings)
+ resolve_sheet_references(catalog,sheet_rows,errors)
+ catalog=[block for block in catalog if block["entries"] and any(block["entries"])]
  return sheets,catalog,errors
 
 def matches(value,patterns):
@@ -563,6 +669,9 @@ def render_group(variable,records,source,metadata=None):
   lines.extend(_comment_lines('Dependencies: '+dep_lines[0]))
   for extra in dep_lines[1:]:lines.extend(_comment_lines(extra))
  lines.extend(['####################','',f'{variable} = ['])
+ string_leaves=set(metadata.get('string_leaves',[]))
+ def typed_hcl(key,value):
+  return json.dumps(str(value),ensure_ascii=False) if key in string_leaves else hcl(value)
  child_paths=metadata.get('child_paths',{})
  for rec in records:
   lines.append('  {')
@@ -575,20 +684,20 @@ def render_group(variable,records,source,metadata=None):
   active=[(k,v) for k,v in scalar if not isinstance(v,DesignDefault)]
   defaults=[(k,v) for k,v in scalar if isinstance(v,DesignDefault)]
   width=max((len(k) for k,v in scalar),default=0)
-  for k,v in active:lines.append(f'    {k.ljust(width)} = {hcl(v)}')
+  for k,v in active:lines.append(f'    {k.ljust(width)} = {typed_hcl(k,v)}')
   if defaults:
    lines.append('    ### Defaults used by design')
-   for k,v in defaults:lines.append(f'    # {k.ljust(width)} = {hcl(v)}')
+   for k,v in defaults:lines.append(f'    # {k.ljust(width)} = {typed_hcl(k,v)}')
   for container,leaves in groups.items():
    lines.append(f'    {container} = [')
    lines.append('      {')
    w=max(len(k) for k,v in leaves)
    for k,v in leaves:
-    if not isinstance(v,DesignDefault):lines.append(f'        {k.ljust(w)} = {hcl(v)}')
+    if not isinstance(v,DesignDefault):lines.append(f'        {k.ljust(w)} = {typed_hcl(k,v)}')
    defaults_child=[(k,v) for k,v in leaves if isinstance(v,DesignDefault)]
    if defaults_child:
     lines.append('        ### Defaults used by design')
-    for k,v in defaults_child:lines.append(f'        # {k.ljust(w)} = {hcl(v)}')
+    for k,v in defaults_child:lines.append(f'        # {k.ljust(w)} = {typed_hcl(k,v)}')
    lines.extend(['      },','    ]'])
   lines.extend(['    terrayang = {','      # with_defaults = "report-all"','    }','  },'])
  lines.extend([']',''])
@@ -719,6 +828,34 @@ def timestamped_run_folder(base):
    continue
  raise RuntimeError('Unable to create a unique timestamped output folder')
 
+def combined_filename(workbook, selected, sheet_patterns=None, config_patterns=None):
+ """Name a merged TFVARS file after what was selected; never use a generic name.
+
+ A single configuration takes precedence. Explicit config choices use config names;
+ explicit sheet choices use sheet names; full workbook uses the workbook name.
+ Long or duplicate-name selections are shortened deterministically.
+ """
+ import hashlib
+ sheets=list(dict.fromkeys(block['sheet'] for block in selected))
+ configs=list(dict.fromkeys(block['config'] for block in selected))
+ if len(selected)==1:
+  names=[selected[0]['config']]
+ elif config_patterns:
+  names=configs
+ elif sheet_patterns:
+  names=sheets
+ elif len(sheets)==1:
+  names=sheets
+ else:
+  names=[workbook.stem]
+ parts=[clean_name(x) for x in names if clean_name(x)]
+ if not parts:parts=[clean_name(workbook.stem) or 'configuration']
+ stem='_'.join(parts)
+ if len(stem)>110:
+  suffix=hashlib.sha256(stem.encode('utf-8')).hexdigest()[:10]
+  stem=stem[:99].rstrip('_')+'_'+suffix
+ return stem+'.tfvars'
+
 def export_configs(workbook,out,selected,warnings,sheet_patterns=None,config_patterns=None,combine='separate'):
  """Export separate files, one file per sheet, or one merged file for all selected sections.
 
@@ -733,7 +870,7 @@ def export_configs(workbook,out,selected,warnings,sheet_patterns=None,config_pat
   stem=block['config'];n=2
   while stem in used:stem=f"{block['config']}_{n}";n+=1
   used.add(stem)
-  if combine=='all':file='terraform_combined.tfvars'
+  if combine=='all':file=combined_filename(workbook,selected,sheet_patterns,config_patterns)
   elif combine=='sheet':file=clean_name(block['sheet'])+'.tfvars'
   else:file=stem+'.tfvars'
   body=render_group(stem,block['entries'],f"{block['sheet']} | {block['path']} | row {block['row']}",block.get('metadata'))
@@ -753,7 +890,7 @@ def main(argv=None):
  p.add_argument('--output',type=Path,default=None)
  p.add_argument('--sheets',help='Sheet names / wildcard patterns separated by commas')
  p.add_argument('--configs','--config',help='Configuration names / wildcard patterns separated by commas')
- p.add_argument('--combine',choices=('separate','sheet','all'),default='separate',help='Write separate configuration files, one combined file per sheet, or one combined file for the selected run')
+ p.add_argument('--combine',choices=('separate','sheet','all'),default='separate',help='Write separate configuration files, one file per sheet, or a named merged file based on the selected sheet/configuration/workbook')
  p.add_argument('--list',action='store_true',help='List detected sheets and configurations without writing files')
  p.add_argument('--all',action='store_true',help='Process all sheets/configurations without a menu')
  p.add_argument('--interactive',action='store_true',help='Force interactive selection menu')
