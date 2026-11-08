@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Terraform Script Generator — dynamic CIQ converter with verified horizontal and vertical target-block extraction. Python 3.10+, stdlib only.
-Output is generic .auto.tfvars HCL maps/lists. Adapt root variable names to your Terraform module.
+Output is generic .tfvars HCL maps/lists. Adapt root variable names to your Terraform module.
 """
 from __future__ import annotations
 import argparse, csv, datetime as dt, fnmatch, json, re, sys, zipfile
@@ -267,35 +267,39 @@ def convert_sheet_sparse(name,rows):
  return data,warnings
 
 def find_vertical_target_values(section, prm):
- """Parse explicit two-column target blocks, never the parameter-description hints.
+ """Extract each repeated Target Values (A2C3) key/value block.
 
- The left-hand leaf column may include slash-separated child-list paths.
- Empty repeated target blocks (often the Current/alternate environment) are ignored.
+ The parameter declaration matrix is authoritative, including bare YANG leaf
+ names (inhibit, cycle, description). Read only the target column immediately
+ after the leaf; do not import review icons or Current Values columns.
  """
+ declared=declared_section_leaves(section,prm)
+ known=set(declared)
  tables=[]
  for pos,(rn,row) in enumerate(section):
-  if rn<=prm or not any(re.search(r"\bTarget Values\s*\(",str(v),re.I) for v in row.values()):
-   continue
-  # A target heading normally occupies the column immediately above the key column.
-  heading_cols=[c for c,v in row.items() if re.search(r"\bTarget Values\s*\(",str(v),re.I)]
-  if not heading_cols:continue
-  keycol=heading_cols[0]
+  headings=[c for c,v in sorted(row.items()) if re.search(r"\bTarget Values\s*\(",str(v),re.I)]
+  if rn<=prm or not headings:continue
+  keycol=headings[0]
+  # Guard against Current Values headings sharing the same line.
+  currentcols=[c for c,v in row.items() if re.search(r"\bCurrent Values\s*\(",str(v),re.I)]
+  boundary=min((c for c in currentcols if c>keycol),default=9999)
+  if keycol+1>=boundary:continue
   rec={}
   for rr,values in section[pos+1:]:
-   if rr>rn+200:break
-   if any(re.search(r'\b(Target Values\s*\(|PARAMATERS|PARAMETERS|YANG\s*Path\s*:)',str(v),re.I) for v in values.values()):break
-   key=str(values.get(keycol,'')).strip()
-   if not is_parameter_name(key):
-    if rec and rr>rn+2:break
-    continue
-   # Target is the cell directly to the right of the named leaf. Other cells
-   # represent review indicators or current values, not the requested target.
+   if rr>rn+500:break
+   if any(re.search(r"\b(?:Target Values\s*\(|PARAMATERS|PARAMETERS|YANG\s*Path\s*:)",str(v),re.I) for v in values.values()):break
+   raw_key=re.sub(r"\s*/\s*",'/',str(values.get(keycol,'')).strip())
+   key=clean_name(raw_key)
+   # Do not confuse the definition table, labels, or other notes with leaf data.
+   if key not in known:continue
    raw=values.get(keycol+1)
    val=normalize(raw)
    if val is None:continue
    if isinstance(val,str) and re.match(r'^(refer to|see value below)',val,re.I):continue
-   rec[clean_name(key)]=val
-  if rec:tables.append((rn,rec))
+   rec[key]=val
+  if rec:
+   # Reorder by parameter declarations, regardless of target row order.
+   tables.append((rn,{k:rec[k] for k in declared if k in rec}))
  return tables
 
 def declared_section_leaves(section, prm):
@@ -686,7 +690,7 @@ def launch_gui(initial_workbook=None, initial_output=None):
    count,records,dest=export_configs(path,dest,selected,source_cache['warnings'],[x for x in source_cache['sheets'] if x in selected_sheets] if mode.get() in ('sheets','both') else ['*'], [x['config'] for x in selected] if mode.get() in ('configs','both') else ['*'],combine=combine_mode.get())
   except Exception as e:messagebox.showerror('Generation error',str(e));return
   status.set(f'Generated {count} configurations ({records} records) into {dest}')
-  messagebox.showinfo('Generation complete',f'Created {count} .auto.tfvars files with {records} records.\n\nFolder: {dest}\nParser warnings: {len(source_cache["warnings"])} (see manifest.json).')
+  messagebox.showinfo('Generation complete',f'Created {count} .tfvars files with {records} records.\n\nFolder: {dest}\nParser warnings: {len(source_cache["warnings"])} (see manifest.json).')
  ttk.Button(frame,text='Generate Terraform Files',command=generate).grid(row=6,column=0,columnspan=3,sticky='ew',pady=(8,8))
  ttk.Label(frame,textvariable=status,wraplength=850).grid(row=7,column=0,columnspan=3,sticky='w')
  ttk.Label(frame,text='Note: Outputs are generic HCL; verify variable schema and types against your Terraform modules.',wraplength=850).grid(row=8,column=0,columnspan=3,sticky='w',pady=(10,0))
@@ -729,9 +733,9 @@ def export_configs(workbook,out,selected,warnings,sheet_patterns=None,config_pat
   stem=block['config'];n=2
   while stem in used:stem=f"{block['config']}_{n}";n+=1
   used.add(stem)
-  if combine=='all':file='terraform_combined.auto.tfvars'
-  elif combine=='sheet':file=clean_name(block['sheet'])+'.auto.tfvars'
-  else:file=stem+'.auto.tfvars'
+  if combine=='all':file='terraform_combined.tfvars'
+  elif combine=='sheet':file=clean_name(block['sheet'])+'.tfvars'
+  else:file=stem+'.tfvars'
   body=render_group(stem,block['entries'],f"{block['sheet']} | {block['path']} | row {block['row']}",block.get('metadata'))
   grouped.setdefault(file,[]).append(body)
   manifest.append({'sheet':block['sheet'],'path':block['path'],'variable':stem,'records':len(block['entries']),'file':file})
@@ -743,7 +747,7 @@ def export_configs(workbook,out,selected,warnings,sheet_patterns=None,config_pat
  return len(grouped),sum(x['records'] for x in manifest),out
 
 def main(argv=None):
- p=argparse.ArgumentParser(description='Terraform Script Generator — dynamic CIQ workbook to .auto.tfvars converter')
+ p=argparse.ArgumentParser(description='Terraform Script Generator — dynamic CIQ workbook to .tfvars converter')
  p.add_argument('workbook',type=Path,nargs='?',help='Source .xlsx file (optional; absent opens desktop app)')
  p.add_argument('--gui',action='store_true',help='Open desktop GUI (with optional prefilled workbook)')
  p.add_argument('--output',type=Path,default=None)
