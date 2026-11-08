@@ -168,6 +168,29 @@ def find_target_tables(section, prm):
  candidates.sort(key=lambda x:(not x[3],x[0],x[1][0][0],-len(x[1]),-len(x[2])))
  return candidates
 
+
+# Use one eligibility rule across the legacy parser, target-table extractor,
+# cross-sheet resolver, and final catalog. Review/Config Status belongs to
+# the section immediately before its YANG Path row.
+OUT_OF_SCOPE = re.compile(r"\bout[\s_-]*of[\s_-]*scope\b", re.I)
+STATUS_LABEL = re.compile(r"\b(?:config|review)\s*status\b", re.I)
+
+def section_is_out_of_scope(rows, path_row):
+ """True only when an explicit section status is Out of Scope.
+
+ Inspect the YANG header and preceding status rows; do not scan descriptions
+ or nearby unrelated section data. Accept merged cells / shifted columns.
+ """
+ nearby=[(rn,row) for rn,row in rows if path_row-5 <= rn <= path_row]
+ for rn,row in nearby:
+  values=[str(v).strip() for _,v in sorted(row.items()) if str(v).strip()]
+  for col,value in row.items():
+   if STATUS_LABEL.search(str(value)):
+    # Status can be in another column of the same row; a textual marker
+    # inside a description must not trigger without the status label.
+    if any(OUT_OF_SCOPE.search(v) for v in values):return True
+ return False
+
 def convert_sheet_legacy(name,rows):
  """Detect full CIQ sections and compact target tables, using clean I:L / I+ target data."""
  data=[]; warnings=[]
@@ -190,8 +213,7 @@ def convert_sheet_legacy(name,rows):
  for ix,(pstart,path) in enumerate(paths):
   pend=paths[ix+1][0] if ix+1<len(paths) else maxrow+1
   # Section status is usually one or two rows immediately before YANG path.
-  status=' '.join(str(v) for j in range(max(1,pstart-3),pstart) for v in indexed.get(j,{}).values())
-  if 'out of scope' in status.lower():continue
+  if section_is_out_of_scope(rows,pstart):continue
   section=[(i,r) for i,r in rows if pstart<i<pend]
   param_rows=[(i,r) for i,r in section if any('PARAMATERS' in str(x).upper() or 'PARAMETERS' in str(x).upper() for x in r.values())]
   if not param_rows:continue
@@ -238,8 +260,7 @@ def convert_sheet_sparse(name,rows):
   return data,warnings
  for ix,(pstart,path) in enumerate(paths):
   pend=paths[ix+1][0] if ix+1<len(paths) else maxrow+1
-  status=' '.join(str(v) for j in range(max(1,pstart-3),pstart) for v in indexed.get(j,{}).values())
-  if 'out of scope' in status.lower():continue
+  if section_is_out_of_scope(rows,pstart):continue
   section=[(i,r) for i,r in rows if pstart<i<pend]
   param_rows=[(i,r) for i,r in section if any('PARAMATERS' in str(x).upper() or 'PARAMETERS' in str(x).upper() for x in r.values())]
   if not param_rows:continue
@@ -406,6 +427,7 @@ def convert_sheet(name,rows):
  maxrow=rows[-1][0]+1 if rows else 1
  replacements={};new=[]
  for idx,(start,path) in enumerate(paths):
+  if section_is_out_of_scope(rows,start):continue
   end=paths[idx+1][0] if idx+1<len(paths) else maxrow
   section=[(i,r) for i,r in rows if start<i<end]
   prm=next((i for i,r in section if any(re.fullmatch(r'PARAMATERS|PARAMETERS',str(v).strip(),re.I) for v in r.values())),None)
@@ -593,6 +615,43 @@ def resolve_sheet_references(catalog, sheet_rows, warnings):
   # Keep the original YANG metadata and canonical variable name.
  return catalog
 
+def enrich_referenced_direct_tables(catalog, warnings):
+ """Give a standalone target table its referring YANG schema and metadata.
+
+ A cross-sheet CIQ often has a rich section declaring nested child lists and
+ a separate values-only worksheet. Directly selecting the values-only sheet
+ must not lose the declared schema or its parent variable name. This is based
+ on discovered `Refer to ... sheet` relationships, not hardcoded TAL names.
+ """
+ by_sheet={}
+ for section in catalog:
+  target=section.get('reference_sheet')
+  if target and section.get('metadata',{}).get('parameter_order'):
+   by_sheet.setdefault(_sheet_token(target),[]).append(section)
+ for direct in catalog:
+  if direct.get('path')!='direct table':continue
+  matches=by_sheet.get(_sheet_token(direct['sheet']),[])
+  if not matches:continue
+  actual=set().union(*(set(r) for r in direct['entries'])) if direct['entries'] else set()
+  ranked=[]
+  for ref in matches:
+   declared=set(ref['metadata'].get('parameter_order',[]))
+   coverage=len(actual & declared)/max(1,len(actual))
+   if coverage>=0.8 and len(actual & declared)>=2:
+    ranked.append((coverage,len(actual & declared),ref))
+  ranked.sort(key=lambda x:(x[0],x[1]),reverse=True)
+  if not ranked:continue
+  if len(ranked)>1 and ranked[0][:2]==ranked[1][:2]:
+   warnings.append(f"{direct['sheet']}: multiple matching referring configurations; cannot infer canonical YANG schema")
+   continue
+  canonical=ranked[0][2]
+  direct['config']=canonical['config']
+  direct['path']=canonical['path']
+  direct['metadata']=dict(canonical['metadata'])
+  direct['entries']=reorder_entries(direct['entries'],direct['metadata']['parameter_order'])
+  direct['inherited_schema_from']=canonical['sheet']
+ return catalog
+
 def discover(workbook):
  catalog=[]; errors=[]; sheets=[]; sheet_rows={}
  for sheet,rows in read_workbook(workbook):
@@ -604,11 +663,15 @@ def discover(workbook):
    warnings=extra if blocks else warnings+extra
   metadata=collect_section_metadata(rows)
   for leaf,entries,path,rn in blocks:
+   # Defense in depth: never put a skipped CIQ section in the catalog.
+   if path != 'direct table' and section_is_out_of_scope(rows,rn):
+    continue
    meta=metadata.get((path,rn),{})
    entries=reorder_entries(entries,meta.get('parameter_order',[]))
    catalog.append({'sheet':sheet,'config':clean_name(leaf),'entries':entries,'path':path,'row':rn,'metadata':meta})
   errors.extend(f'{sheet}: {w}' for w in warnings)
  resolve_sheet_references(catalog,sheet_rows,errors)
+ enrich_referenced_direct_tables(catalog,errors)
  catalog=[block for block in catalog if block["entries"] and any(block["entries"])]
  return sheets,catalog,errors
 
@@ -670,8 +733,11 @@ def render_group(variable,records,source,metadata=None):
   for extra in dep_lines[1:]:lines.extend(_comment_lines(extra))
  lines.extend(['####################','',f'{variable} = ['])
  string_leaves=set(metadata.get('string_leaves',[]))
- def typed_hcl(key,value):
-  return json.dumps(str(value),ensure_ascii=False) if key in string_leaves else hcl(value)
+ def typed_hcl(key,value,container=None):
+  # Declared string types are indexed by complete YANG child path. A nested
+  # leaf is rendered with its short name, but must retain its original type.
+  qualified=f'{container}_{key}' if container else key
+  return json.dumps(str(value),ensure_ascii=False) if qualified in string_leaves or key in string_leaves else hcl(value)
  child_paths=metadata.get('child_paths',{})
  for rec in records:
   lines.append('  {')
@@ -693,11 +759,11 @@ def render_group(variable,records,source,metadata=None):
    lines.append('      {')
    w=max(len(k) for k,v in leaves)
    for k,v in leaves:
-    if not isinstance(v,DesignDefault):lines.append(f'        {k.ljust(w)} = {typed_hcl(k,v)}')
+    if not isinstance(v,DesignDefault):lines.append(f'        {k.ljust(w)} = {typed_hcl(k,v,container)}')
    defaults_child=[(k,v) for k,v in leaves if isinstance(v,DesignDefault)]
    if defaults_child:
     lines.append('        ### Defaults used by design')
-    for k,v in defaults_child:lines.append(f'        # {k.ljust(w)} = {typed_hcl(k,v)}')
+    for k,v in defaults_child:lines.append(f'        # {k.ljust(w)} = {typed_hcl(k,v,container)}')
    lines.extend(['      },','    ]'])
   lines.extend(['    terrayang = {','      # with_defaults = "report-all"','    }','  },'])
  lines.extend([']',''])
@@ -866,7 +932,15 @@ def export_configs(workbook,out,selected,warnings,sheet_patterns=None,config_pat
   raise ValueError(f'Unknown combine mode: {combine}')
  out=timestamped_run_folder(out)
  manifest=[];used=set();grouped={}
+ # A full-workbook or combined export may select both the referring CIQ section
+ # and the standalone table it references. Prefer the source CIQ metadata and
+ # emit the configuration exactly once if records and canonical path match.
+ seen_equivalent=set()
  for block in selected:
+  fingerprint=(block['path'],block['config'],json.dumps(block['entries'],sort_keys=True,default=str))
+  if fingerprint in seen_equivalent:
+   continue
+  seen_equivalent.add(fingerprint)
   stem=block['config'];n=2
   while stem in used:stem=f"{block['config']}_{n}";n+=1
   used.add(stem)
