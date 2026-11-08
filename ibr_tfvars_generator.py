@@ -20,7 +20,14 @@ def colnum(label):
  return n
 
 def clean_name(v):
- v=str(v).strip().replace('/','_').replace('-','_').lower()
+ """Normalize CIQ/YANG leaf paths consistently, including wrapped Excel cells.
+
+ A displayed child path may contain a newline or spaces surrounding its slash,
+ e.g. `tal-info-ta-entry/\n tal-info-mcc`. Both metadata declarations and
+ the target-table headings must resolve to the same canonical key.
+ """
+ v=re.sub(r'\s*/\s*', '/', str(v).strip())
+ v=v.replace('/','_').replace('-','_').lower()
  v=NAME.sub('_',v).strip('_')
  return ('v_'+v) if v and v[0].isdigit() else v
 
