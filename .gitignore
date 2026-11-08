@@ -1,0 +1,20 @@
+# Configuration data, generated output, and local settings
+input/*
+!input/.gitkeep
+output/*
+!output/.gitkeep
+Terraform_Output_*/
+*.auto.tfvars
+*.tfvars
+*.tfvars.json
+*.tfstate
+*.tfstate.*
+.terraform/
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+Thumbs.db
+.idea/
