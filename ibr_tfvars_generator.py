@@ -959,6 +959,34 @@ def render_multilevel_group(variable,records,source,metadata):
  for key in metadata.get('parameter_order',[]):path_map.setdefault(key,[key])
  roots=OrderedDict()
 
+ def identify_child(row,prefix,declared_keys,options):
+  """Identify a child without dropping optional/unset YANG key fields.
+
+  Prefer *complete* declared keys.  When a key was omitted (e.g. [ENC]
+  or an unconfigured API prefix), use the other direct leaf values only as
+  a provisional identity. Never invent a missing leaf or silently overwrite.
+  """
+  actual=[k for k in declared_keys if k in row and row[k] is not None]
+  if len(actual)==len(declared_keys) and actual:
+   return tuple((k,row[k]) for k in actual)
+  siblings=[k for k in metadata.get('parameter_order',[])
+            if k in row and tuple(path_map[k][:-1])==prefix and k not in declared_keys]
+  available=actual+siblings
+  if not available:
+   # No direct identity: only attach if an ancestor uniquely determines this
+   # child. More than one possible child is unsafe and remains an error.
+   if len(options)==1 and not declared_keys:
+    return options[0]['identity']
+   missing=[k for k in declared_keys if k not in row]
+   raise ValueError(f'{variable}: missing child-list key(s) {missing} for {"/".join(prefix)}; no usable scalar to infer instance')
+  identity=(('__inferred_identity__',True),)+tuple((k,row[k]) for k in available)
+  msg=(f'{variable}: {"/".join(prefix)} missing declared key(s) '
+       f'{[k for k in declared_keys if k not in row]}; using available child values '
+       'as provisional identity; validate against YANG before applying')
+  if msg not in metadata.setdefault('validation_warnings',[]):
+   metadata['validation_warnings'].append(msg)
+  return identity
+
  def add_child(node,path,fullkey,value):
   if len(path)==1:
    leaf=path[0]
@@ -998,14 +1026,8 @@ def render_multilevel_group(variable,records,source,metadata):
     ancestor_path=prefix[:ancestor]
     token=ancestor_path[-1]
     options=parent['children'].setdefault(token,[])
-    key_names=[k for k in metadata.get('parameter_order',[]) if k in key_fields and k in row and tuple(path_map[k][:-1])==ancestor_path]
-    identity=tuple((k,row[k]) for k in key_names)
     declared_keys=[k for k in metadata.get('parameter_order',[]) if k in key_fields and tuple(path_map[k][:-1])==ancestor_path]
-    if declared_keys and len(identity)!=len(declared_keys):
-     missing=[k for k in declared_keys if k not in row]
-     raise ValueError(f'{variable}: missing ancestor key(s) {missing} for child list {"/".join(ancestor_path)}; refusing orphan entry')
-    if not identity:
-     raise ValueError(f'{variable}: no identifier for ancestor list {"/".join(ancestor_path)}; refusing ambiguous merge')
+    identity=identify_child(row,ancestor_path,declared_keys,options)
     child=next((x for x in options if x['identity']==identity),None)
     if child is None:
      child={'values':OrderedDict(),'children':OrderedDict(),'identity':identity}
@@ -1013,19 +1035,12 @@ def render_multilevel_group(variable,records,source,metadata):
     parent=child
    token=prefix[-1]
    options=parent['children'].setdefault(token,[])
-   key_names=[k for k in metadata.get('parameter_order',[]) if k in key_fields and k in row and tuple(path_map[k][:-1])==prefix]
-   if not key_names:
-    # When a child-list has no marked key leaf in the CIQ template, the
-    # first declared member identifies repeated instances. Avoid overwrite.
-    key_names=next(([k] for k in metadata.get('parameter_order',[])
-                    if k in row and tuple(path_map[k][:-1])==prefix),[])
-   identity=tuple((k,row[k]) for k in key_names)
    declared_keys=[k for k in metadata.get('parameter_order',[]) if k in key_fields and tuple(path_map[k][:-1])==prefix]
-   if declared_keys and len(identity)!=len(declared_keys):
-    missing=[k for k in declared_keys if k not in row]
-    raise ValueError(f'{variable}: missing child-list key(s) {missing} for {"/".join(prefix)}; refusing unsafe merge')
-   if not identity:
-    raise ValueError(f'{variable}: missing identifiable child key for {"/".join(prefix)}; refusing silent overwrite')
+   if not declared_keys:
+    # Older CIQs sometimes mark no list key; use its first declared leaf.
+    declared_keys=next(([k] for k in metadata.get('parameter_order',[])
+                        if k in row and tuple(path_map[k][:-1])==prefix),[])
+   identity=identify_child(row,prefix,declared_keys,options)
    child=next((x for x in options if x['identity']==identity),None)
    # Reject inconsistent rows reusing an explicit child key. With an
    # unkeyed list, differing first-leaf values are separate identities.
@@ -1412,6 +1427,8 @@ def export_configs(workbook,out,selected,warnings,sheet_patterns=None,config_pat
    file=clean_name(block['sheet'])+'.tfvars'
   else:file=stem+'.tfvars'
   body=render_group(stem,block['entries'],f"{block['sheet']} | {path} | row {block['row']}",block.get('metadata'))
+  for message in (block.get('metadata') or {}).get('validation_warnings',[]):
+   if message not in warnings:warnings.append(message)
   grouped.setdefault(file,[]).append(body)
   manifest.append({'sheet':', '.join(block.get('source_sheets',[block['sheet']])),
                    'path':path,'variable':stem,'records':len(block['entries']),'file':file})
