@@ -357,6 +357,21 @@ def find_vertical_target_values(section, prm):
   currentcols=[c for c,v in row.items() if re.search(r"\bCurrent Values\s*\(",str(v),re.I)]
   boundary=min((c for c in currentcols if c>keycol),default=9999)
   if keycol+1>=boundary:continue
+  # Child keys are scoped to their declared YANG depth. A repeated inner
+  # child key starts a new inner instance without losing its ancestor service.
+  # A repeated outer key starts an entirely new outer instance.
+  depth_by_leaf={}
+  first_at_depth={}
+  for declared_key in declared:
+   if declared_key in known:
+    # A normalized full child path has one underscore-joined token per
+    # original slash segment. Read the actual declaration to get its depth.
+    matching=next((str(r.get(2,'')) for rnum,r in section if prm<rnum<rn
+                   and clean_name(re.sub(r'\s*/\s*','/',str(r.get(2,''))))==declared_key),None)
+    if matching and '/' in matching:
+     depth=matching.count('/')+1
+     depth_by_leaf[declared_key]=depth
+     first_at_depth.setdefault(depth,declared_key)
   parent={};child={};records=[]
   for rr,values in section[pos+1:]:
    if rr>rn+500:break
@@ -369,13 +384,15 @@ def find_vertical_target_values(section, prm):
    if val is None:continue
    if isinstance(val,str) and re.match(r'^(refer to|see value below)',val,re.I):continue
    if '/' in raw_key:
-    # The start of a new child record is signalled by the repeated key.
-    # If no child key is marked, use its first declared leaf. Repeated
-    # non-key fields must not silently overwrite an existing value.
-    if child and ((key in child_keys and key in child) or
-                  (not child_keys and key==first_child and key in child) or
-                  (key in child and child[key]!=val)):
-     records.append({**parent,**child});child={}
+    depth=depth_by_leaf.get(key,raw_key.count('/')+1)
+    is_key=(key in child_keys or (not child_keys and key==first_at_depth.get(depth)))
+    # Repeating a declared key starts a new instance at that hierarchy level.
+    # Keep shallower ancestor values (e.g. service name/scheme) whenever a
+    # deeper list instance (e.g. service IP) starts. Do NOT keep its sibling
+    # values when a new outer list instance starts.
+    if child and key in child and (is_key or child[key]!=val):
+     records.append({**parent,**child})
+     child={k:v for k,v in child.items() if depth_by_leaf.get(k,2)<depth}
     child[key]=val
    else:
     # A new parent starts a new record. Never carry child objects from
@@ -983,6 +1000,12 @@ def render_multilevel_group(variable,records,source,metadata):
     options=parent['children'].setdefault(token,[])
     key_names=[k for k in metadata.get('parameter_order',[]) if k in key_fields and k in row and tuple(path_map[k][:-1])==ancestor_path]
     identity=tuple((k,row[k]) for k in key_names)
+    declared_keys=[k for k in metadata.get('parameter_order',[]) if k in key_fields and tuple(path_map[k][:-1])==ancestor_path]
+    if declared_keys and len(identity)!=len(declared_keys):
+     missing=[k for k in declared_keys if k not in row]
+     raise ValueError(f'{variable}: missing ancestor key(s) {missing} for child list {"/".join(ancestor_path)}; refusing orphan entry')
+    if not identity:
+     raise ValueError(f'{variable}: no identifier for ancestor list {"/".join(ancestor_path)}; refusing ambiguous merge')
     child=next((x for x in options if x['identity']==identity),None)
     if child is None:
      child={'values':OrderedDict(),'children':OrderedDict(),'identity':identity}
@@ -997,6 +1020,12 @@ def render_multilevel_group(variable,records,source,metadata):
     key_names=next(([k] for k in metadata.get('parameter_order',[])
                     if k in row and tuple(path_map[k][:-1])==prefix),[])
    identity=tuple((k,row[k]) for k in key_names)
+   declared_keys=[k for k in metadata.get('parameter_order',[]) if k in key_fields and tuple(path_map[k][:-1])==prefix]
+   if declared_keys and len(identity)!=len(declared_keys):
+    missing=[k for k in declared_keys if k not in row]
+    raise ValueError(f'{variable}: missing child-list key(s) {missing} for {"/".join(prefix)}; refusing unsafe merge')
+   if not identity:
+    raise ValueError(f'{variable}: missing identifiable child key for {"/".join(prefix)}; refusing silent overwrite')
    child=next((x for x in options if x['identity']==identity),None)
    # Reject inconsistent rows reusing an explicit child key. With an
    # unkeyed list, differing first-leaf values are separate identities.
