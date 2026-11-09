@@ -1360,6 +1360,10 @@ def export_configs(workbook,out,selected,warnings,sheet_patterns=None,config_pat
   raise ValueError(f'Unknown combine mode: {combine}')
  original_selected=selected
  selected=consolidate_same_yang_container(selected,warnings)
+ # Preserve the relative order of every other configuration, but always emit
+ # the consolidated AMF/MME network-element groups as the final block in any
+ # output file that contains them. Stable sorting does not affect members.
+ selected.sort(key=lambda block: block['config'] == 'amfmme_ne_grp_entry')
  # Plan and render in memory before creating files, so a conflicting YANG
  # child key cannot cause a partially written Terraform configuration.
  grouped={};manifest=[];names={}
