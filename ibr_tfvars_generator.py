@@ -367,6 +367,44 @@ def declared_section_leaves(section, prm):
   if norm and norm not in declared:declared.append(norm)
  return declared
 
+def is_continuation_marker(value):
+ """CIQ arrow glyphs mean carry forward the previous parent key/value."""
+ if value is None:return False
+ token=str(value).strip().replace('\xa0','')
+ return bool(token) and bool(re.fullmatch(r'[↪⇢↳→➜⇒↦⤷]+',token))
+
+
+def repair_shifted_target_cells(values,columns,declared,section,prm):
+ """Recover a displaced last text/numeric pair, without changing valid columns.
+
+ Some CIQs have a blank cause cell followed by a text cause in the numeric
+ NASC column and a numeric value in the immediate following spare column.
+ Use the declared types to ensure the shift is unambiguous.
+ """
+ result=dict(values)
+ if len(columns)<2:return result
+ numeric=set()
+ text=set()
+ for rn,row in section:
+  if rn<=prm:continue
+  if any('Target Values' in str(v) for v in row.values()):break
+  key=clean_name(row.get(2,''))
+  if key not in declared:continue
+  desc=str(row.get(7,'')).lower()
+  if re.search(r'\btype\s*:\s*(?:u?int(?:8|16|32|64)?\b)',desc):numeric.add(key)
+  if re.search(r'\btype\s*:\s*(?:string\b|[^\n]*,\s*string\b)',desc):text.add(key)
+ for i in range(1,len(columns)):
+  prevcol,prevkey=columns[i-1];col,key=columns[i]
+  if prevkey not in text or key not in numeric:continue
+  if normalize(result.get(prevcol)) is not None:continue
+  shifted=normalize(result.get(col)); next_value=normalize(result.get(col+1))
+  if shifted is None or next_value is None:continue
+  if not re.fullmatch(r'[+-]?\d+',str(next_value)):continue
+  if re.fullmatch(r'[+-]?\d+',str(shifted)):continue
+  result[prevcol]=result[col];result[col]=result[col+1]
+ return result
+
+
 def find_horizontal_target_values(section, prm):
  """Read multi-row target grids using the declared parameter/leaf schema.
 
@@ -398,6 +436,7 @@ def find_horizontal_target_values(section, prm):
     header_at=j; columns=candidates;break
   if header_at is None:continue
   records=[];blank=0
+  previous_values={}
   colset={c for c,_ in columns}
   previous_row=section[header_at][0]
   for rr,values in section[header_at+1:]:
@@ -412,9 +451,12 @@ def find_horizontal_target_values(section, prm):
    # Stop at the first supplementary details/reference table.
    if is_supplementary_details_row(values):break
    record={}
+   corrected=repair_shifted_target_cells(values,columns,declared,section,prm)
    for col,key in columns:
-    val=normalize(values.get(col))
+    raw=corrected.get(col)
+    val=previous_values.get(key) if is_continuation_marker(raw) else normalize(raw)
     if val is not None:record[key]=val
+   for key,value in record.items():previous_values[key]=value
    # A valid record needs its first/key leaf; avoids standalone notes.
    if not record or columns[0][1] not in record:
     blank+=1
@@ -524,7 +566,7 @@ def collect_section_metadata(rows):
  for i,(start,path) in enumerate(paths):
   end=paths[i+1][0] if i+1<len(paths) else (rows[-1][0]+1 if rows else start+1)
   section=[(rn,row) for rn,row in rows if start<=rn<end]
-  metadata={'yang_path':path,'cli_command':'','description':'','dependencies':'','parameter_order':[],'child_paths':{},'string_leaves':[]}
+  metadata={'yang_path':path,'cli_command':'','description':'','dependencies':'','parameter_order':[],'child_paths':{},'string_leaves':[],'key_leaves':[],'numeric_leaves':[]}
   state=None
   for rn,row in section:
    values=[str(v).strip() for _,v in sorted(row.items()) if str(v).strip()]
@@ -544,12 +586,15 @@ def collect_section_metadata(rows):
     if (is_parameter_name(leaf) or (re.fullmatch(r'[A-Za-z][A-Za-z0-9_.:-]*',str(leaf).strip()) and re.search(r'\b(?:key\s+leaf|leaf|leaf-list|child\s+list)\b',str(row.get(3,'')).lower()))):
      key=clean_name(leaf)
      if key not in metadata['parameter_order']:metadata['parameter_order'].append(key)
+     if 'key leaf' in str(row.get(3,'')).lower() and key not in metadata['key_leaves']:metadata['key_leaves'].append(key)
      definition=str(row.get(7,'')).lower().replace('_x000d_', '\n')
      if re.search(r'\btype\s*:\s*(?:string\b|[^\n]*,\s*string\b)',definition) and key not in metadata['string_leaves']:
       metadata['string_leaves'].append(key)
+     if re.search(r'\btype\s*:\s*(?:u?int(?:8|16|32|64)?\b)',definition) and key not in metadata['numeric_leaves']:
+      metadata['numeric_leaves'].append(key)
      if '/' in str(leaf):
       parts=[clean_name(part.strip()) for part in str(leaf).split('/') if part.strip()]
-      if len(parts)==2:metadata['child_paths'][key]=parts
+      if len(parts)>=2:metadata['child_paths'][key]=parts
     elif re.match(r'^Target Values',first,re.I):state=None
   result[(path,start)]=metadata
  return result
@@ -792,9 +837,127 @@ def _comment_lines(value):
    lines.append('### '+line)
  return lines
 
+def render_multilevel_group(variable,records,source,metadata):
+ """Render repeated CIQ rows as arbitrarily deep YANG child-list hierarchies.
+
+ Root and child lists are grouped by their declared key leaves. They are not
+ grouped by values from arbitrary non-key fields. All levels preserve input
+ order; repeated service names accumulate individual cause entries.
+ """
+ from collections import OrderedDict
+ child_paths=metadata['child_paths']
+ key_fields=set(metadata.get('key_leaves',[]))
+ string_fields=set(metadata.get('string_leaves',[]))
+ path_map={key:parts for key,parts in child_paths.items()}
+ for key in metadata.get('parameter_order',[]):path_map.setdefault(key,[key])
+ roots=OrderedDict()
+
+ def add_child(node,path,fullkey,value):
+  if len(path)==1:
+   leaf=path[0]
+   existing=node['values'].get(leaf)
+   if existing is not None and existing!=value:
+    raise ValueError(f'Conflicting values for {fullkey}: {existing!r} versus {value!r}')
+   node['values'][leaf]=(fullkey,value)
+   return
+  container=path[0]
+  candidates=node['children'].setdefault(container,[])
+  # Children are selected per target row, not from leaf value alone.
+  return container,candidates,path[1:]
+
+ # For each raw row select each level by the key leaf in its declared path.
+ for row in records:
+  root_keys=[k for k in metadata.get('parameter_order',[]) if k in key_fields and k not in child_paths]
+  root_id=tuple((k,row.get(k)) for k in root_keys)
+  if not root_id or any(v is None for _,v in root_id):
+   raise ValueError(f'{variable}: missing top-level key in target row: {row}')
+  root=roots.setdefault(root_id,{'values':OrderedDict(),'children':OrderedDict(),'ids':{}})
+  # First collect scalar leaves. Follow metadata order for deterministic output.
+  for fullkey in metadata.get('parameter_order',[]):
+   if fullkey in row and fullkey not in child_paths:
+    item=(fullkey,row[fullkey])
+    old=root['values'].get(fullkey)
+    if old is not None and old!=item:raise ValueError(f'{variable}: conflicting parent {fullkey}')
+    root['values'][fullkey]=item
+  containers=OrderedDict()
+  for fullkey in metadata.get('parameter_order',[]):
+   if fullkey in row and fullkey in child_paths:
+    parts=path_map[fullkey]
+    for level in range(1,len(parts)):
+     prefix=tuple(parts[:level]);containers.setdefault(prefix,[]).append((fullkey,parts))
+  for prefix in sorted(containers,key=len):
+   parent=root
+   for ancestor in range(1,len(prefix)):
+    ancestor_path=prefix[:ancestor]
+    token=ancestor_path[-1]
+    options=parent['children'].setdefault(token,[])
+    key_names=[k for k in metadata.get('parameter_order',[]) if k in key_fields and k in row and tuple(path_map[k][:-1])==ancestor_path]
+    identity=tuple((k,row[k]) for k in key_names)
+    child=next((x for x in options if x['identity']==identity),None)
+    if child is None:
+     child={'values':OrderedDict(),'children':OrderedDict(),'identity':identity}
+     options.append(child)
+    parent=child
+   token=prefix[-1]
+   options=parent['children'].setdefault(token,[])
+   key_names=[k for k in metadata.get('parameter_order',[]) if k in key_fields and k in row and tuple(path_map[k][:-1])==prefix]
+   identity=tuple((k,row[k]) for k in key_names)
+   child=next((x for x in options if x['identity']==identity),None)
+   if child is None:
+    child={'values':OrderedDict(),'children':OrderedDict(),'identity':identity}
+    options.append(child)
+   for fullkey,parts in containers[prefix]:
+    if tuple(parts[:-1])!=prefix:continue
+    leaf=parts[-1];old=child['values'].get(leaf)
+    item=(fullkey,row[fullkey])
+    if old is not None and old!=item:
+     raise ValueError(f'{variable}: conflicting child-list key {fullkey}')
+    child['values'][leaf]=item
+
+ lines=['####################']
+ path=metadata.get('yang_path') or (source.split(' | ')[1] if ' | ' in source else '')
+ if path:lines.extend(_comment_lines('Xpath: '+path))
+ if metadata.get('cli_command'):lines.extend(_comment_lines('CLI Commands: '+metadata['cli_command']))
+ if metadata.get('description'):
+  lines.append('### Description:');lines.extend(_comment_lines(metadata['description']))
+ if metadata.get('dependencies'):
+  dep=str(metadata['dependencies']).splitlines()
+  lines.extend(_comment_lines('Dependencies: '+dep[0]))
+  for item in dep[1:]:lines.extend(_comment_lines(item))
+ lines+=['####################','',f'{variable} = [']
+ def render_node(node,indent):
+  pad=' '*indent
+  lines.append(pad+'{')
+  active=[(k,v) for k,(full,v) in node['values'].items() if not isinstance(v,DesignDefault)]
+  default=[(k,v) for k,(full,v) in node['values'].items() if isinstance(v,DesignDefault)]
+  w=max([len(k) for k in node['values']] or [0])
+  for k,v in active:
+   full=node['values'][k][0]
+   formatted=json.dumps(str(v),ensure_ascii=False) if full in string_fields else hcl(v)
+   lines.append(pad+f'  {k.ljust(w)} = {formatted}')
+  if default:
+   lines.append(pad+'  ### Defaults used by design')
+   for k,v in default:
+    full=node['values'][k][0]
+    formatted=json.dumps(str(v),ensure_ascii=False) if full in string_fields else hcl(v)
+    lines.append(pad+f'  # {k.ljust(w)} = {formatted}')
+  for container,children in node['children'].items():
+   lines.append(pad+f'  {container} = [')
+   for child in children:render_node(child,indent+4)
+   lines.append(pad+'  ]')
+  if indent==2:
+   lines.extend([pad+'  terrayang = {',pad+'    # with_defaults = "report-all"',pad+'  }'])
+  lines.append(pad+'},')
+ for root in roots.values():render_node(root,2)
+ lines+= [']','']
+ return '\n'.join(lines)
+
+
 def render_group(variable,records,source,metadata=None):
  """Emit CIQ metadata, ordered scalar leaves and nested child-list entries."""
  metadata=metadata or {}
+ if any(len(x)>=3 for x in metadata.get('child_paths',{}).values()):
+  return render_multilevel_group(variable,records,source,metadata)
  lines=['####################']
  path=metadata.get('yang_path') or (source.split(' | ')[1] if ' | ' in source else '')
  if path:lines.extend(_comment_lines('Xpath: '+path))
