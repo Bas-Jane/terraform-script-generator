@@ -120,7 +120,7 @@ def take_table(rows,start,end,header_row,head_columns):
  seen=set(); cols=[(c,n) for c,n in cols if not (n in seen or seen.add(n))]
  for rn,r in rows:
   if rn<=start or rn>=end:continue
-  if is_header(r):break
+  if is_header(r) or is_post_target_note(r):break
   raw=[r.get(c) for c,_ in cols]
   if not any(normalize(x) is not None for x in raw):continue
   rec={name:normalize(r.get(c)) for c,name in cols if normalize(r.get(c)) is not None}
@@ -311,42 +311,83 @@ def is_supplementary_details_row(row):
  return False
 
 
-def find_vertical_target_values(section, prm):
- """Extract each repeated Target Values (A2C3) key/value block.
+def is_post_target_note(row):
+ """Reject explanatory notes following target data, not actual leaf values.
 
- The parameter declaration matrix is authoritative, including bare YANG leaf
- names (inhibit, cycle, description). Read only the target column immediately
- after the leaf; do not import review icons or Current Values columns.
+ Notes can appear without blank rows or in the target key column, e.g.
+ '* Note: Ensure AMFAUTH-CONF is aligned with these values'.
+ Only inspect the leading nonempty text; avoid excluding string values
+ containing the word 'note' elsewhere in a legitimate field.
+ """
+ cells=[str(v).replace('\u00a0',' ').strip() for _,v in sorted(row.items())
+        if v is not None and str(v).strip()]
+ if not cells:return False
+ first=re.sub(r'\s+', ' ', cells[0]).strip()
+ # Excel copy/pastes may use literal stars, bullets, or numbered NOTE: labels.
+ return bool(re.match(r'(?i)^(?:[\*•▪‣-]\s*)?(?:note\s*[:：]|notes\s*[:：]|remarks?\s*[:：]|\*\s*note\b)',first))
+
+
+def find_vertical_target_values(section, prm):
+ """Read vertical target blocks, keeping *every* repeated child-list instance.
+
+ Child-list instances begin when a declared child key leaf recurs (or, if
+ the CIQ does not identify one, when the first child field recurs). This
+ handles SGW/PGW/SCP groups, EIR action lists and other vertical tables.
+ Parent scalar values are carried to each instance; [ENC] is skipped.
  """
  declared=declared_section_leaves(section,prm)
  known=set(declared)
+ child_keys=[]
+ for rr,row in section:
+  if rr<=prm:continue
+  if any(re.search(r"\bTarget Values\s*\(",str(v),re.I) for v in row.values()):break
+  raw_key=re.sub(r"\s*/\s*",'/',str(row.get(2,'')).strip())
+  key=clean_name(raw_key)
+  typ=re.sub(r'\s+',' ',str(row.get(3,''))).lower()
+  if '/' in raw_key and key in known and 'key leaf' in typ:
+   child_keys.append(key)
+ first_child=next((k for k in declared if k in known and
+                   any(k==clean_name(re.sub(r"\s*/\s*",'/',str(r.get(2,''))))
+                       and '/' in str(r.get(2,'')) for _,r in section if _>prm)),None)
  tables=[]
  for pos,(rn,row) in enumerate(section):
   headings=[c for c,v in sorted(row.items()) if re.search(r"\bTarget Values\s*\(",str(v),re.I)]
   if rn<=prm or not headings:continue
   keycol=headings[0]
-  # Guard against Current Values headings sharing the same line.
   currentcols=[c for c,v in row.items() if re.search(r"\bCurrent Values\s*\(",str(v),re.I)]
   boundary=min((c for c in currentcols if c>keycol),default=9999)
   if keycol+1>=boundary:continue
-  rec={}
+  parent={};child={};records=[]
   for rr,values in section[pos+1:]:
    if rr>rn+500:break
-   if is_supplementary_details_row(values):break
+   if is_supplementary_details_row(values) or is_post_target_note(values):break
    if any(re.search(r"\b(?:Target Values\s*\(|PARAMATERS|PARAMETERS|YANG\s*Path\s*:)",str(v),re.I) for v in values.values()):break
    raw_key=re.sub(r"\s*/\s*",'/',str(values.get(keycol,'')).strip())
    key=clean_name(raw_key)
-   # Do not confuse the definition table, labels, or other notes with leaf data.
    if key not in known:continue
-   raw=values.get(keycol+1)
-   val=normalize(raw)
+   val=normalize(values.get(keycol+1))
    if val is None:continue
    if isinstance(val,str) and re.match(r'^(refer to|see value below)',val,re.I):continue
-   rec[key]=val
-  if rec:
-   # Reorder by parameter declarations, regardless of target row order.
-   tables.append((rn,{k:rec[k] for k in declared if k in rec}))
+   if '/' in raw_key:
+    # The start of a new child record is signalled by the repeated key.
+    # If no child key is marked, use its first declared leaf. Repeated
+    # non-key fields must not silently overwrite an existing value.
+    if child and ((key in child_keys and key in child) or
+                  (not child_keys and key==first_child and key in child) or
+                  (key in child and child[key]!=val)):
+     records.append({**parent,**child});child={}
+    child[key]=val
+   else:
+    # A new parent starts a new record. Never carry child objects from
+    # one parent into another or replace an earlier completed group.
+    if key in parent and parent[key]!=val:
+     if parent or child:records.append({**parent,**child})
+     parent={};child={}
+    parent[key]=val
+  if parent or child:records.append({**parent,**child})
+  tables.extend((rn,{k:rec[k] for k in declared if k in rec}) for rec in records)
  return tables
+
 
 def declared_section_leaves(section, prm):
  """Extract declared leaf names from the PARAMATERS matrix, including bare names.
@@ -449,7 +490,7 @@ def find_horizontal_target_values(section, prm):
    if any(re.search(r"\b(?:Target Values\s*\(|Current Values\s*\(|PARAMATERS|PARAMETERS|YANG\s*Path\s*:)",str(v),re.I) for v in values.values()):break
    if sum(clean_name(values.get(c,'')) in known for c in colset)>=2:break
    # Stop at the first supplementary details/reference table.
-   if is_supplementary_details_row(values):break
+   if is_supplementary_details_row(values) or is_post_target_note(values):break
    record={}
    corrected=repair_shifted_target_cells(values,columns,declared,section,prm)
    for col,key in columns:
@@ -609,15 +650,37 @@ def reorder_entries(entries,leaf_order):
 
 # Cross-sheet reference resolution is intentionally schema-driven; no PLMN-specific
 # value lists or leaf names are hardcoded here.
-SHEET_REFERENCE = re.compile(r"(?:=+>\s*)?refer\s+to\s+(.+?)\s+sheet\.?\s*$", re.I)
+# Detect CIQ cross-worksheet pointers at the section heading, target field,
+# or explicit trailing instruction. Not tied to any network element or tab.
+SHEET_REFERENCE = re.compile(
+ r"(?:^|\b)(?:[=\-]\s*>\s*)?refer\s+to\s+(.+?)\s+sheet\s*\.?\s*$",
+ re.I,
+)
 
 def referenced_sheet(value):
  if not isinstance(value,str):return None
- match=SHEET_REFERENCE.search(value.strip())
- return match.group(1).strip(" .\t\"'") if match else None
+ value=re.sub(r"\s+", " ", value.replace("\xa0", " ")).strip()
+ match=SHEET_REFERENCE.search(value)
+ if not match:return None
+ target=match.group(1).strip(" .\t\"'\u2018\u2019\u201c\u201d")
+ return target or None
 
 def _sheet_token(value):
+ # Normalize spaces, case, underscores and punctuation, including in names
+ # broken by spreadsheet formatting (e.g. 'PGW  Groups').
  return re.sub(r"[^a-z0-9]+", "", str(value).casefold())
+
+def _match_referenced_worksheet(target, sheet_rows):
+ """Find an unambiguous worksheet by its complete normalized name.
+
+ Never use approximate substring/fuzzy matching: a wrong worksheet can
+ generate deployable configuration with unintended values.
+ """
+ token=_sheet_token(target)
+ hits=[(name, rows) for name,rows in sheet_rows.items() if _sheet_token(name)==token]
+ if len(hits)==1:return hits[0],None
+ if len(hits)>1:return None,f"ambiguous worksheet name '{target}' ({', '.join(n for n,_ in hits)})"
+ return None,f"referenced worksheet '{target}' not found"
 
 def section_level_sheet_references(rows):
  """Find a CIQ section's external target worksheet without reading other sections.
@@ -647,67 +710,97 @@ def section_level_sheet_references(rows):
   elif len(unique)>1:found[start]=list(unique.values())
  return found
 
-def extract_reference_grid(rows, wanted_keys, warnings, sheet_name):
- """Parse target-only grids, including wide tables with a repeated Current Values header.
+def _reference_leaf_alias(header, declared):
+ """Resolve an exact leaf or a uniquely shortened YANG leaf path.
 
- Parameters are determined by the referring section's YANG leaf definitions.
- Repeated header names mark the end of the first/Target Values grid; read
- none of the current/review columns. A row is a record only if its key leaves
- are populated, preventing blank notes from becoming objects.
+ Some value-only CIQ worksheets explicitly remove a shared namespace prefix
+ (e.g. amfmme-ne-grp -> ne-grp). Never guess when two declarations share a
+ shortened suffix; missing or ambiguous references remain unresolved.
  """
- from difflib import get_close_matches
- known=set(wanted_keys)
+ key=clean_name(re.sub(r"\s*/\s*", "/", str(header).strip()))
+ if key in declared:return key
+ candidates=[]
+ namespace_prefixes={full.split('_')[0]+'_' for full in declared if '_' in full}
+ for full in declared:
+  if (key and full.endswith('_'+key)) or any(full.replace(prefix,'')==key for prefix in namespace_prefixes):
+   candidates.append(full)
+ return candidates[0] if len(candidates)==1 else None
+
+
+def extract_reference_grid(rows, wanted_keys, warnings, sheet_name):
+ """Parse only target-side data, honoring shortened headers and CIQ arrows.
+
+ Retain one physical record per populated row; repeated parent values are
+ carried forward explicitly and grouped by YANG list keys at render time.
+ """
+ known=list(dict.fromkeys(wanted_keys))
  options=[]
  for ix,(rn,row) in enumerate(rows):
-  header=[];used=set()
+  header=[];used=set();aliases=[]
   for col,value in sorted(row.items()):
-   key=clean_name(re.sub(r"\s*/\s*", "/",str(value).strip()))
-   if key in used:break  # duplicate means second (Current Values) grid
-   if key in known:
+   key=_reference_leaf_alias(value,known)
+   if key is None:
+    from difflib import get_close_matches
+    cleaned=clean_name(value)
+    close=get_close_matches(cleaned,known,n=2,cutoff=0.9)
+    if len(close)==1 and abs(len(close[0])-len(cleaned))<=1 and cleaned.split('_')[0]==close[0].split('_')[0]:
+     key=close[0]
+     warnings.append(f'{sheet_name}: mapped header {cleaned} to declared {key}')
+   if key is not None:
+    if key in used:break # Duplicate headers introduce Current Values grid.
     header.append((col,key));used.add(key)
-   elif key not in known and '_' in key:
-    # Only accept a unique one-character typo in an otherwise matching header;
-    # record it in manifest warnings for manual validation.
-    close=get_close_matches(key,list(known-used),n=2,cutoff=0.9)
-    if len(close)==1 and abs(len(close[0])-len(key))<=1 and key.split('_')[0]==close[0].split('_')[0]:
-     header.append((col,close[0]));used.add(close[0])
-     warnings.append(f'{sheet_name}: mapped header {key} to declared {close[0]}')
-  # A plausible grid must contain at least 2 declared columns, including
-  # its first two key leaves where such keys are declared.
-  required=wanted_keys[:1]  # remaining key leafs may be explicitly [ENC]
-  if len(header)<2 or not all(k in used for k in required):continue
-  records=[]
+    if clean_name(value)!=key:aliases.append((value,key))
+  if len(header)<2 or known[0] not in used:continue
+  records=[];previous={};last_rr=rn
   for rr,vals in rows[ix+1:]:
    if rr>rn+100000:break
-   if is_supplementary_details_row(vals):break
+   if records and rr>last_rr+1:break
+   last_rr=rr
+   if is_supplementary_details_row(vals) or is_post_target_note(vals):break
    if any(re.search(r'\b(?:Target Values\s*\(|PARAMATERS|PARAMETERS|YANG\s*Path\s*:)',str(v),re.I) for v in vals.values()):break
-   rec={key:normalize(vals.get(col)) for col,key in header if normalize(vals.get(col)) is not None}
-   if all(k in rec for k in required) and len(rec)>=2:
-    records.append({k:rec[k] for k in wanted_keys if k in rec})
-   elif records and not any(vals.get(col) for col,_ in header):break
-  if records:options.append((len(used),len(records),-header[0][0],records))
+   rec={}
+   for col,key in header:
+    raw=vals.get(col)
+    if is_continuation_marker(raw):
+     value=previous.get(key)
+    else:
+     value=normalize(raw)
+    if value is not None:rec[key]=value
+   if known[0] in rec and len(rec)>=2:
+    records.append({k:rec[k] for k in known if k in rec})
+    previous.update(rec)
+   elif records:
+    # Blank/marker-only row or secondary notes mark table end.
+    break
+  if records:options.append((len(used),len(records),-header[0][0],records,aliases))
  if not options:return []
- # First maximize field coverage, then records, then prefer leftmost grid.
- return max(options,key=lambda x:x[:3])[3]
+ winner=max(options,key=lambda x:x[:3])
+ # Diagnostic only; avoid repeated warnings for every row.
+ return winner[3]
 
 def resolve_sheet_references(catalog, sheet_rows, warnings):
- """Follow full-sheet `Refer to ... sheet` pointers without emitting them as values.
+ """Follow any declared `Refer to <sheet> sheet` pointer generically.
 
- Do not guess when an exact named worksheet is absent. Unresolved references
- are excluded from generated assignments and recorded as warnings.
+ A full CIQ section can mention its target worksheet in the header, in
+ a target-value placeholder, or in a footer. Keep the originating YANG
+ definition as the source of names/types/nested lists. No placeholder
+ text may become a Terraform assignment.
  """
- by_name={_sheet_token(name):(name,rows) for name,rows in sheet_rows.items()}
  for block in catalog:
   entries=block['entries']
   pointers={referenced_sheet(v) for record in entries for v in record.values() if referenced_sheet(v)}
+  explicit=block.get('declared_reference')
+  if explicit:pointers.add(explicit)
   if not pointers:continue
-  if len(pointers)!=1:
+  unique={_sheet_token(p):p for p in pointers}
+  if len(unique)!=1:
    warnings.append(f"{block['sheet']} / {block['config']}: ambiguous referenced sheets: {sorted(pointers)}")
    block['entries']=[{k:v for k,v in r.items() if referenced_sheet(v) is None} for r in entries]
    continue
-  target=next(iter(pointers));hit=by_name.get(_sheet_token(target))
-  if hit is None:
-   warnings.append(f"{block['sheet']} / {block['config']}: referenced worksheet '{target}' not found")
+  target=next(iter(unique.values()))
+  hit,error=_match_referenced_worksheet(target,sheet_rows)
+  if error:
+   warnings.append(f"{block['sheet']} / {block['config']}: {error}")
    block['entries']=[{k:v for k,v in r.items() if referenced_sheet(v) is None} for r in entries]
    continue
   target_name,raw_rows=hit
@@ -719,16 +812,14 @@ def resolve_sheet_references(catalog, sheet_rows, warnings):
    continue
   block['entries']=grid
   block['reference_sheet']=target_name
-  # Keep the original YANG metadata and canonical variable name.
  return catalog
 
 def enrich_referenced_direct_tables(catalog, warnings):
- """Give a standalone target table its referring YANG schema and metadata.
+ """Inherit YANG declarations for directly selected referenced worksheets.
 
- A cross-sheet CIQ often has a rich section declaring nested child lists and
- a separate values-only worksheet. Directly selecting the values-only sheet
- must not lose the declared schema or its parent variable name. This is based
- on discovered `Refer to ... sheet` relationships, not hardcoded TAL names.
+ Prefer the already validated cross-sheet result to values-only direct tables,
+ so shortened target headers, continuation arrows and nested lists all retain
+ their correct interpretation in independent sheet-selection mode as well.
  """
  by_sheet={}
  for section in catalog:
@@ -738,24 +829,14 @@ def enrich_referenced_direct_tables(catalog, warnings):
  for direct in catalog:
   if direct.get('path')!='direct table':continue
   matches=by_sheet.get(_sheet_token(direct['sheet']),[])
-  if not matches:continue
-  actual=set().union(*(set(r) for r in direct['entries'])) if direct['entries'] else set()
-  ranked=[]
-  for ref in matches:
-   declared=set(ref['metadata'].get('parameter_order',[]))
-   coverage=len(actual & declared)/max(1,len(actual))
-   if coverage>=0.8 and len(actual & declared)>=2:
-    ranked.append((coverage,len(actual & declared),ref))
-  ranked.sort(key=lambda x:(x[0],x[1]),reverse=True)
-  if not ranked:continue
-  if len(ranked)>1 and ranked[0][:2]==ranked[1][:2]:
-   warnings.append(f"{direct['sheet']}: multiple matching referring configurations; cannot infer canonical YANG schema")
+  if len(matches)!=1:
+   if len(matches)>1:warnings.append(f"{direct['sheet']}: multiple referring sections; cannot infer unique YANG schema")
    continue
-  canonical=ranked[0][2]
+  canonical=matches[0]
   direct['config']=canonical['config']
   direct['path']=canonical['path']
   direct['metadata']=dict(canonical['metadata'])
-  direct['entries']=reorder_entries(direct['entries'],direct['metadata']['parameter_order'])
+  direct['entries']=reorder_entries(canonical['entries'],direct['metadata']['parameter_order'])
   direct['inherited_schema_from']=canonical['sheet']
  return catalog
 
@@ -790,7 +871,16 @@ def discover(workbook):
     continue
    meta=metadata.get((path,rn),{})
    entries=reorder_entries(entries,meta.get('parameter_order',[]))
-   catalog.append({'sheet':sheet,'config':clean_name(leaf),'entries':entries,'path':path,'row':rn,'metadata':meta})
+   block={'sheet':sheet,'config':clean_name(leaf),'entries':entries,'path':path,'row':rn,'metadata':meta}
+   # A section-level pointer may be present even when the legacy extractor
+   # returns a nonempty (but placeholder-only) entry. Keep it explicitly;
+   # relying on extracted values alone misses such cross-sheet sections.
+   if path != 'direct table':
+    ref=section_refs.get(rn)
+    if isinstance(ref,str):block['declared_reference']=ref
+    elif isinstance(ref,list):
+     warnings.append(f'{path}: ambiguous sheet pointers: {ref}')
+   catalog.append(block)
   errors.extend(f'{sheet}: {w}' for w in warnings)
  resolve_sheet_references(catalog,sheet_rows,errors)
  enrich_referenced_direct_tables(catalog,errors)
@@ -901,8 +991,15 @@ def render_multilevel_group(variable,records,source,metadata):
    token=prefix[-1]
    options=parent['children'].setdefault(token,[])
    key_names=[k for k in metadata.get('parameter_order',[]) if k in key_fields and k in row and tuple(path_map[k][:-1])==prefix]
+   if not key_names:
+    # When a child-list has no marked key leaf in the CIQ template, the
+    # first declared member identifies repeated instances. Avoid overwrite.
+    key_names=next(([k] for k in metadata.get('parameter_order',[])
+                    if k in row and tuple(path_map[k][:-1])==prefix),[])
    identity=tuple((k,row[k]) for k in key_names)
    child=next((x for x in options if x['identity']==identity),None)
+   # Reject inconsistent rows reusing an explicit child key. With an
+   # unkeyed list, differing first-leaf values are separate identities.
    if child is None:
     child={'values':OrderedDict(),'children':OrderedDict(),'identity':identity}
     options.append(child)
@@ -911,7 +1008,7 @@ def render_multilevel_group(variable,records,source,metadata):
     leaf=parts[-1];old=child['values'].get(leaf)
     item=(fullkey,row[fullkey])
     if old is not None and old!=item:
-     raise ValueError(f'{variable}: conflicting child-list key {fullkey}')
+     raise ValueError(f'{variable}: child list {token}, identity {identity}: conflicting {fullkey}; no values were overwritten')
     child['values'][leaf]=item
 
  lines=['####################']
@@ -956,8 +1053,38 @@ def render_multilevel_group(variable,records,source,metadata):
 def render_group(variable,records,source,metadata=None):
  """Emit CIQ metadata, ordered scalar leaves and nested child-list entries."""
  metadata=metadata or {}
- if any(len(x)>=3 for x in metadata.get('child_paths',{}).values()):
-  return render_multilevel_group(variable,records,source,metadata)
+ # Every declared child list uses the same hierarchical renderer. The old
+ # single-child renderer silently discarded siblings or created duplicate
+ # parent objects when child values changed. Do not use it for YANG lists.
+ child_paths=metadata.get('child_paths',{})
+ root_keys=[k for k in metadata.get('key_leaves',[]) if k not in child_paths]
+ legacy_independent_rows=False
+ if child_paths and root_keys and all(all(k in row for k in root_keys) for row in records):
+  # Some older CIQs omit a parent key marker (e.g. a TAC) even though
+  # it distinguishes separate parent objects. Keep these records separate
+  # rather than coalescing incompatible parent scalar values.
+  scalar_by_parent={}
+  conflicting_parent=False
+  for row in records:
+   identity=tuple((k,row[k]) for k in root_keys)
+   scalars={k:v for k,v in row.items() if k not in child_paths}
+   old=scalar_by_parent.setdefault(identity,{})
+   if any(k in old and old[k]!=v for k,v in scalars.items()):
+    conflicting_parent=True
+    break
+   old.update(scalars)
+  if not conflicting_parent:
+   return render_multilevel_group(variable,records,source,metadata)
+  if any(len(parts)>2 for parts in child_paths.values()):
+   raise ValueError(f'{variable}: inconsistent parent values with multilevel child lists; verify declared YANG keys')
+  # These are distinct parent records with an incomplete key declaration.
+  legacy_independent_rows=True
+
+ # Without a complete parent key, group identity cannot be proven. Preserve
+ # legacy rendering for isolated records, but refuse ambiguous multiple-row
+ # child data rather than silently dropping or combining instances.
+ if child_paths and len(records)>1 and not legacy_independent_rows:
+  raise ValueError(f'{variable}: child-list rows lack a complete declared parent key; cannot safely combine them')
  lines=['####################']
  path=metadata.get('yang_path') or (source.split(' | ')[1] if ' | ' in source else '')
  if path:lines.extend(_comment_lines('Xpath: '+path))
@@ -1162,34 +1289,100 @@ def combined_filename(workbook, selected, sheet_patterns=None, config_patterns=N
   stem=stem[:99].rstrip('_')+'_'+suffix
  return stem+'.tfvars'
 
-def export_configs(workbook,out,selected,warnings,sheet_patterns=None,config_patterns=None,combine='separate'):
- """Export separate files, one file per sheet, or one merged file for all selected sections.
+def consolidate_same_yang_container(selected, warnings):
+ """Combine CIQ sections defining the same canonical YANG list.
 
- Preserve each configuration's own header and root variable; collisions are suffixed
- to keep the output valid when duplicate configuration names exist.
+ Identity is (YANG path, Terraform variable), never the displayed worksheet
+ title or an arbitrary numbered suffix. Duplicate parent/reference copies are
+ ignored; distinct parent keys and repeated child rows are retained in order.
  """
+ from collections import OrderedDict
+ groups=OrderedDict()
+ for block in selected:
+  path=str(block.get('path','')).strip().rstrip('/')
+  name=block['config']
+  # A direct table has no unique schema; never infer a common container from it.
+  key=(path,name) if path and path!='direct table' else ('direct',name,block['sheet'])
+  if key not in groups:
+   new=dict(block)
+   new['entries']=[]
+   new['metadata']=dict(block.get('metadata') or {})
+   new['source_sheets']=[block['sheet']]
+   new['_record_signatures']=set()
+   groups[key]=new
+  target=groups[key]
+  if block['sheet'] not in target['source_sheets']:
+   target['source_sheets'].append(block['sheet'])
+  source_meta=block.get('metadata') or {}
+  dest_meta=target['metadata']
+  for field in ('parameter_order','key_leaves','string_leaves'):
+   merged=list(dest_meta.get(field) or [])
+   for leaf in source_meta.get(field) or []:
+    if leaf not in merged:merged.append(leaf)
+   if merged:dest_meta[field]=merged
+  for leaf,parts in (source_meta.get('child_paths') or {}).items():
+   dest_meta.setdefault('child_paths',{})
+   if leaf in dest_meta['child_paths'] and dest_meta['child_paths'][leaf]!=parts:
+    raise ValueError(f"{name}: inconsistent YANG child path for {leaf}")
+   dest_meta['child_paths'][leaf]=parts
+  for field in ('yang_path','cli_command','description'):
+   existing=dest_meta.get(field)
+   incoming=source_meta.get(field)
+   if incoming and existing and str(incoming).strip()!=str(existing).strip():
+    warnings.append(f"{name}: differing {field} across sections; retained first section's value")
+   elif incoming and not existing:dest_meta[field]=incoming
+  deps=list(dict.fromkeys(line.strip() for line in str(dest_meta.get('dependencies') or '').splitlines() if line.strip()))
+  for line in str(source_meta.get('dependencies') or '').splitlines():
+   line=line.strip()
+   if line and line not in deps:deps.append(line)
+  if deps:dest_meta['dependencies']='\n'.join(deps)
+  for record in block['entries']:
+   signature=json.dumps(record,sort_keys=True,default=str,ensure_ascii=False)
+   if signature not in target['_record_signatures']:
+    target['_record_signatures'].add(signature)
+    target['entries'].append(record)
+ for group in groups.values():
+  group.pop('_record_signatures',None)
+  group['entries']=reorder_entries(group['entries'],group['metadata'].get('parameter_order',[]))
+ return list(groups.values())
+
+
+def export_configs(workbook,out,selected,warnings,sheet_patterns=None,config_patterns=None,combine='separate'):
+ """Export one canonical Terraform variable for each unique YANG container.
+
+ Repeated sections are consolidated before output grouping. Where multiple
+ sheets define the same canonical variable in sheet mode, the cross-sheet
+ variable is emitted to its own named file to prevent duplicate variable
+ assignments in multiple sheet output files.
+ """
+ import hashlib
  if combine not in ('separate','sheet','all'):
   raise ValueError(f'Unknown combine mode: {combine}')
- out=timestamped_run_folder(out)
- manifest=[];used=set();grouped={}
- # A full-workbook or combined export may select both the referring CIQ section
- # and the standalone table it references. Prefer the source CIQ metadata and
- # emit the configuration exactly once if records and canonical path match.
- seen_equivalent=set()
+ original_selected=selected
+ selected=consolidate_same_yang_container(selected,warnings)
+ # Plan and render in memory before creating files, so a conflicting YANG
+ # child key cannot cause a partially written Terraform configuration.
+ grouped={};manifest=[];names={}
+ combined=combined_filename(workbook,original_selected,sheet_patterns,config_patterns) if combine=='all' else None
  for block in selected:
-  fingerprint=(block['path'],block['config'],json.dumps(block['entries'],sort_keys=True,default=str))
-  if fingerprint in seen_equivalent:
-   continue
-  seen_equivalent.add(fingerprint)
-  stem=block['config'];n=2
-  while stem in used:stem=f"{block['config']}_{n}";n+=1
-  used.add(stem)
-  if combine=='all':file=combined_filename(workbook,selected,sheet_patterns,config_patterns)
-  elif combine=='sheet':file=clean_name(block['sheet'])+'.tfvars'
+  stem=block['config']
+  path=block.get('path','')
+  identity=(path,stem)
+  previous=names.get(stem)
+  if previous is not None and previous!=identity:
+   # Different schema under a coincidentally equal variable name: refuse
+   # ambiguous Terraform assignments rather than adding arbitrary _2 suffixes.
+   raise ValueError(f"Different YANG paths both require variable '{stem}': {previous[0]} and {path}. Resolve naming explicitly.")
+  names[stem]=identity
+  if combine=='all':file=combined
+  elif combine=='sheet' and len(block.get('source_sheets',[]))==1:
+   file=clean_name(block['sheet'])+'.tfvars'
   else:file=stem+'.tfvars'
-  body=render_group(stem,block['entries'],f"{block['sheet']} | {block['path']} | row {block['row']}",block.get('metadata'))
+  body=render_group(stem,block['entries'],f"{block['sheet']} | {path} | row {block['row']}",block.get('metadata'))
   grouped.setdefault(file,[]).append(body)
-  manifest.append({'sheet':block['sheet'],'path':block['path'],'variable':stem,'records':len(block['entries']),'file':file})
+  manifest.append({'sheet':', '.join(block.get('source_sheets',[block['sheet']])),
+                   'path':path,'variable':stem,'records':len(block['entries']),'file':file})
+ out=timestamped_run_folder(out)
  for file,bodies in grouped.items():
   (out/file).write_text('\n'.join(bodies),encoding='utf-8')
  (out/'manifest.json').write_text(json.dumps({'input':workbook.name,'combine_mode':combine,'generated_files':list(grouped),'selected_sheets':sheet_patterns or ['*'],'selected_configurations':config_patterns or ['*'],'outputs':manifest,'warnings':warnings},indent=2),encoding='utf-8')
