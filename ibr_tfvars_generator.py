@@ -4,6 +4,7 @@ Output is generic .tfvars HCL maps/lists. Adapt root variable names to your Terr
 """
 from __future__ import annotations
 import argparse, csv, datetime as dt, fnmatch, json, re, sys, zipfile
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from xml.etree import ElementTree as ET
 from collections import Counter
@@ -37,7 +38,7 @@ class DesignDefault(str):
 def normalize(v,omit_markers=True):
  if v is None:return None
  v=str(v).replace('\xa0',' ').strip()
- if v.lower() in SKIP:return None
+ if v.lower() in SKIP or re.fullmatch(r'\[\s*(?:TBD|ENC|SKIP|TELUS-INPUT)\s*\]',v,re.I):return None
  m=DEFAULT.match(v)
  if m:
   value=m.group(1).strip()
@@ -52,6 +53,55 @@ INTEGER = re.compile(r'^[+-]?(?:0|[1-9][0-9]*)$')
 DECIMAL = re.compile(r'^[+-]?[0-9]+\.[0-9]+$')
 LEADING_ZERO = re.compile(r'^[+-]?0[0-9]+$')
 
+SCI_NUMBER = re.compile(r'^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)[eE][+-]?[0-9]+$')
+
+
+def plain_decimal(value):
+ """Preserve decimal notation for every leaf; never emit an exponent.
+
+ Ordinary decimal text (including significant trailing zeroes) is unchanged.
+ Numeric scientific strings are expanded using Decimal, avoiding binary-float
+ formatting. Long 16+-digit IEEE-754 display artifacts may be shortened only
+ if the difference is <= 1e-15 relative; genuinely higher-precision values
+ are left intact. Leading-zero identifiers are not interpreted as decimals.
+ """
+ raw=str(value).strip()
+ scientific=bool(SCI_NUMBER.fullmatch(raw))
+ if not scientific and not DECIMAL.fullmatch(raw):
+  return raw
+ if not scientific and len(raw.lstrip('+-').replace('.', '').lstrip('0')) < 16:
+  return raw  # Keep the original spelling, e.g. 95.0 or 0.00400.
+ try:
+  exact=Decimal(raw)
+ except InvalidOperation:
+  return raw
+ if not exact.is_finite():
+  return raw
+ cleaned=exact
+ digits=len(exact.as_tuple().digits)
+ if digits >= 16 and exact != 0:
+  for precision in range(1, 16):
+   exponent=exact.adjusted()-precision+1
+   rounded=exact.quantize(Decimal(1).scaleb(exponent))
+   if abs(exact-rounded) <= abs(exact)*Decimal('1e-15'):
+    cleaned=rounded
+    break
+ if not scientific and cleaned == exact:
+  return raw
+ result=format(cleaned,'f')
+ if '.' in result:
+  result=result.rstrip('0').rstrip('.')
+  if '.' not in result:
+   result += '.0'
+ return result
+
+
+def formatted_text(value):
+ """Apply one decimal-safe formatter to all assigned and default leaf values."""
+ raw=str(value)
+ return plain_decimal(raw) if SCI_NUMBER.fullmatch(raw.strip()) or DECIMAL.fullmatch(raw.strip()) else raw
+
+
 def hcl(v):
  """Emit whole numbers as HCL numbers, but quote decimals and leading-zero identifiers.
 
@@ -60,7 +110,7 @@ def hcl(v):
  """
  if isinstance(v,list):return '['+', '.join(hcl(x) for x in v)+']'
  if v is None:return 'null'
- raw=str(v)
+ raw=formatted_text(v)
  if LEADING_ZERO.fullmatch(raw):return json.dumps(raw,ensure_ascii=False)
  if INTEGER.fullmatch(raw):return raw
  return json.dumps(raw,ensure_ascii=False)
@@ -377,6 +427,13 @@ def find_vertical_target_values(section, prm):
    if rr>rn+500:break
    if is_supplementary_details_row(values) or is_post_target_note(values):break
    if any(re.search(r"\b(?:Target Values\s*\(|PARAMATERS|PARAMETERS|YANG\s*Path\s*:)",str(v),re.I) for v in values.values()):break
+   # A horizontal Target Values leaf-header row is not a vertical
+   # (leaf, assigned-value) pair.  For example, B=smppi-info-ppi and
+   # C=smppi-info-smsvc are BOTH declared leaves; never serialize C
+   # as the value of B.  This also covers sparse or duplicated grids.
+   header_matches={clean_name(v) for c,v in values.items()
+                   if keycol<=c<boundary and clean_name(v) in known}
+   if len(header_matches)>=2:continue
    raw_key=re.sub(r"\s*/\s*",'/',str(values.get(keycol,'')).strip())
    key=clean_name(raw_key)
    if key not in known:continue
@@ -558,7 +615,7 @@ def convert_sheet(name,rows):
  paths=[(i,next((str(v).split('YANG Path:',1)[1].strip() for v in r.values() if 'YANG Path:' in str(v)),''))
         for i,r in rows if any('YANG Path:' in str(v) for v in r.values())]
  maxrow=rows[-1][0]+1 if rows else 1
- replacements={};new=[]
+ replacements={};new=[];suppress_legacy=set()
  for idx,(start,path) in enumerate(paths):
   if section_is_out_of_scope(rows,start):continue
   end=paths[idx+1][0] if idx+1<len(paths) else maxrow
@@ -570,8 +627,33 @@ def convert_sheet(name,rows):
    # Each row is one record. Do not consume duplicated Current Values columns.
    recs=horizontal[0][1]
   else:
+   # The existence of a declared horizontal target HEADER is authoritative,
+   # even when every data row is unresolved ([TBD], [ENC], or empty).
+   declared=declared_section_leaves(section,prm)
+   has_horizontal_header=False
+   for j,(header_rn,header_row) in enumerate(section):
+    if header_rn<=prm or not any(re.search(r"\bTarget Values\s*\(",str(v),re.I) for v in header_row.values()):continue
+    for next_rn,next_row in section[j+1:j+5]:
+     if next_rn>header_rn+4:break
+     known_headers={clean_name(v) for v in next_row.values()}
+     if len(known_headers.intersection(declared))>=2:
+      has_horizontal_header=True;break
+    if has_horizontal_header:break
+   if has_horizontal_header and not any(any(re.search(r"\bRefer\s+to\s+.+?\s+sheet\b",str(v),re.I) for v in r.values()) for _,r in section):
+    suppress_legacy.add((path,start))
+    continue
    tables=find_vertical_target_values(section,prm)
-   if not tables:continue
+   if not tables:
+    # A real Target Values grid with no assignments (e.g. the only
+    # row is [TBD]) must override legacy header/description fallbacks.
+    # Do not suppress a cross-sheet pointer: the resolver handles it.
+    has_target_grid=any(any(re.search(r"\bTarget Values\s*\(",str(v),re.I)
+                            for v in r.values()) for _,r in section if _>prm)
+    has_sheet_pointer=any(any(re.search(r"\bRefer\s+to\s+.+?\s+sheet\b",str(v),re.I)
+                              for v in r.values()) for _,r in section)
+    if has_target_grid and not has_sheet_pointer:
+     suppress_legacy.add((path,start))
+    continue
    recs=[record for _,record in tables]
   # Prefer the first populated target block. Later blocks are additional
   # records only when they also contain real assigned values.
@@ -580,6 +662,7 @@ def convert_sheet(name,rows):
   if ident in old_map:replacements[old_map[ident]]=replacement
   else:new.append(replacement)
  for i,replacement in replacements.items():baseline[i]=replacement
+ baseline=[b for b in baseline if (b[2],b[3]) not in suppress_legacy]
  baseline.extend(new)
  return baseline,base_warnings
 
@@ -1074,13 +1157,13 @@ def render_multilevel_group(variable,records,source,metadata):
   w=max([len(k) for k in node['values']] or [0])
   for k,v in active:
    full=node['values'][k][0]
-   formatted=json.dumps(str(v),ensure_ascii=False) if full in string_fields else hcl(v)
+   formatted=json.dumps(formatted_text(v),ensure_ascii=False) if full in string_fields else hcl(v)
    lines.append(pad+f'  {k.ljust(w)} = {formatted}')
   if default:
    lines.append(pad+'  ### Defaults used by design')
    for k,v in default:
     full=node['values'][k][0]
-    formatted=json.dumps(str(v),ensure_ascii=False) if full in string_fields else hcl(v)
+    formatted=json.dumps(formatted_text(v),ensure_ascii=False) if full in string_fields else hcl(v)
     lines.append(pad+f'  # {k.ljust(w)} = {formatted}')
   for container,children in node['children'].items():
    lines.append(pad+f'  {container} = [')
@@ -1148,7 +1231,7 @@ def render_group(variable,records,source,metadata=None):
   # Declared string types are indexed by complete YANG child path. A nested
   # leaf is rendered with its short name, but must retain its original type.
   qualified=f'{container}_{key}' if container else key
-  return json.dumps(str(value),ensure_ascii=False) if qualified in string_leaves or key in string_leaves else hcl(value)
+  return json.dumps(formatted_text(value),ensure_ascii=False) if qualified in string_leaves or key in string_leaves else hcl(value)
  child_paths=metadata.get('child_paths',{})
  for rec in records:
   lines.append('  {')
