@@ -990,6 +990,35 @@ def enrich_referenced_direct_tables(catalog, warnings):
   direct['inherited_schema_from']=canonical['sheet']
  return catalog
 
+def validate_declared_target_types(catalog, warnings):
+ """Report CIQ column shifts without fabricating replacement values.
+
+ Numeric YANG leaves must not contain enumeration/text tokens. This detects
+ bad spreadsheet alignments such as inact-tmr=rel while permitting omitted
+ values and commented defaults. Validation is advisory: target data is never
+ silently replaced using adjacent cells or Current Values columns.
+ """
+ for block in catalog:
+  meta=block.get('metadata') or {}
+  numeric=set(meta.get('numeric_leaves') or [])
+  for index,entry in enumerate(block.get('entries') or [],1):
+   for key in numeric.intersection(entry):
+    value=entry[key]
+    if isinstance(value,DesignDefault):value=str(value)
+    if isinstance(value,list):
+     values=value
+    else:values=[value]
+    for item in values:
+     if item is None:continue
+     item=str(item).strip()
+     if item and not re.fullmatch(r'[+-]?[0-9]+',item):
+      warning=(f"{block['sheet']} / {block['config']} record {index}: "
+               f"numeric leaf {key} contains {item!r}; possible shifted "
+               'CIQ row; verify Target Values against YANG')
+      if warning not in warnings:warnings.append(warning)
+ return catalog
+
+
 def discover(workbook):
  catalog=[]; errors=[]; sheets=[]; sheet_rows={}
  for sheet,rows in read_workbook(workbook):
@@ -1035,6 +1064,7 @@ def discover(workbook):
  resolve_sheet_references(catalog,sheet_rows,errors)
  enrich_referenced_direct_tables(catalog,errors)
  catalog=[block for block in catalog if block["entries"] and any(block["entries"])]
+ validate_declared_target_types(catalog,errors)
  return sheets,catalog,errors
 
 def matches(value,patterns):
@@ -1134,11 +1164,20 @@ def render_multilevel_group(variable,records,source,metadata):
   return container,candidates,path[1:]
 
  # For each raw row select each level by the key leaf in its declared path.
- for row in records:
+ for record_index,row in enumerate(records):
   root_keys=[k for k in metadata.get('parameter_order',[]) if k in key_fields and k not in child_paths]
   root_id=tuple((k,row.get(k)) for k in root_keys)
   if not root_id or any(v is None for _,v in root_id):
-   raise ValueError(f'{variable}: missing top-level key in target row: {row}')
+   if not metadata.get('preserve_incomplete_parent_rows'):
+    raise ValueError(f'{variable}: missing top-level key in target row: {row}')
+   # Do not guess a parent key or silently merge unrelated rows. Use a
+   # source-row identity for grouping only; do not emit it in Terraform.
+   root_id=(('__source_row__',record_index),)
+   warning=(f'{variable}: source record {record_index+1} has incomplete '
+            'declared parent keys; preserved separately; verify required '
+            'YANG keys before applying')
+   warnings=metadata.setdefault('validation_warnings',[])
+   if warning not in warnings:warnings.append(warning)
   root=roots.setdefault(root_id,{'values':OrderedDict(),'children':OrderedDict(),'ids':{}})
   # First collect scalar leaves. Follow metadata order for deterministic output.
   for fullkey in metadata.get('parameter_order',[]):
@@ -1261,7 +1300,13 @@ def render_group(variable,records,source,metadata=None):
  # legacy rendering for isolated records, but refuse ambiguous multiple-row
  # child data rather than silently dropping or combining instances.
  if child_paths and len(records)>1 and not legacy_independent_rows:
-  raise ValueError(f'{variable}: child-list rows lack a complete declared parent key; cannot safely combine them')
+  # Preserve incomplete-key rows independently instead of aborting the
+  # entire workbook or silently combining them into a wrong parent.
+  # Their missing YANG keys remain missing and are logged as warnings.
+  safe_metadata=dict(metadata)
+  safe_metadata['preserve_incomplete_parent_rows']=True
+  safe_metadata['validation_warnings']=metadata.setdefault('validation_warnings',[])
+  return render_multilevel_group(variable,records,source,safe_metadata)
  lines=['####################']
  path=metadata.get('yang_path') or (source.split(' | ')[1] if ' | ' in source else '')
  if path:lines.extend(_comment_lines('Xpath: '+path))
