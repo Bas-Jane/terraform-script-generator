@@ -1524,6 +1524,17 @@ def consolidate_same_yang_container(selected, warnings):
  return list(groups.values())
 
 
+def workbook_sheet_numbers(workbook):
+ """Return 1-based original Excel worksheet positions, including hidden sheets.
+
+ This reads workbook.xml directly, so selecting only a subset of sheets never
+ renumbers them. Sheet positions are independent of parsed/valid configurations.
+ """
+ with zipfile.ZipFile(workbook) as z:
+  root=ET.fromstring(z.read('xl/workbook.xml'))
+ names=[sheet.attrib['name'] for sheet in root.findall('m:sheets/m:sheet',NS)]
+ return {name:idx for idx,name in enumerate(names,1)},max(2,len(str(len(names))))
+
 def export_configs(workbook,out,selected,warnings,sheet_patterns=None,config_patterns=None,combine='separate'):
  """Export one canonical Terraform variable for each unique YANG container.
 
@@ -1545,6 +1556,7 @@ def export_configs(workbook,out,selected,warnings,sheet_patterns=None,config_pat
  # child key cannot cause a partially written Terraform configuration.
  grouped={};manifest=[];names={}
  combined=combined_filename(workbook,original_selected,sheet_patterns,config_patterns) if combine=='all' else None
+ sheet_numbers, sheet_digits = workbook_sheet_numbers(workbook) if combine=='sheet' else ({},2)
  for block in selected:
   stem=block['config']
   path=block.get('path','')
@@ -1556,8 +1568,18 @@ def export_configs(workbook,out,selected,warnings,sheet_patterns=None,config_pat
    raise ValueError(f"Different YANG paths both require variable '{stem}': {previous[0]} and {path}. Resolve naming explicitly.")
   names[stem]=identity
   if combine=='all':file=combined
-  elif combine=='sheet' and len(block.get('source_sheets',[]))==1:
-   file=clean_name(block['sheet'])+'.tfvars'
+  elif combine=='sheet':
+   # Prefix with the original physical worksheet position, not the selection
+   # index. Consolidated cross-sheet containers remain anchored to their first
+   # defining sheet rather than being arbitrarily renumbered.
+   source_sheet=block['sheet']
+   if source_sheet not in sheet_numbers:
+    raise ValueError(f"Cannot determine Excel sheet number for {source_sheet!r}")
+   prefix=f"{sheet_numbers[source_sheet]:0{sheet_digits}d}_"
+   if len(block.get('source_sheets',[]))==1:
+    file=prefix+clean_name(source_sheet)+'.tfvars'
+   else:
+    file=prefix+stem+'.tfvars'
   else:file=stem+'.tfvars'
   body=render_group(stem,block['entries'],f"{block['sheet']} | {path} | row {block['row']}",block.get('metadata'))
   for message in (block.get('metadata') or {}).get('validation_warnings',[]):
