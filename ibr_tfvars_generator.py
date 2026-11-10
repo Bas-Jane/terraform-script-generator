@@ -582,6 +582,48 @@ def find_horizontal_target_values(section, prm):
   if records:results.append((rn,records))
  return results
 
+def find_inline_parameter_targets(section, prm):
+ """Extract values stored on PARAMATERS definition rows (no later Target Values block).
+
+ Determine the target column from the PARAMATERS header, not from fixed
+ positions. The Type field must identify a leaf, avoiding descriptions,
+ remarks, Current Values, and review symbols. This applies to any new
+ scalar container with inline Target Value columns.
+ """
+ header=next((row for rn,row in section if rn==prm),{})
+ targetcols=[c for c,v in header.items()
+             if re.search(r"^\s*Target\s+Values?\s*(?:\([^)]*\))?\s*$",str(v),re.I)]
+ if not targetcols:return []
+ targetcol=min(targetcols)
+ typecols=[c for c,v in header.items() if str(v).strip().lower()=="type"]
+ if not typecols:return []
+ typecol=typecols[0]
+ namecol=next((c for c,v in header.items()
+               if re.fullmatch(r"PARAMATERS|PARAMETERS",str(v).strip(),re.I)),None)
+ if namecol is None:return []
+ # A real Target Values section elsewhere takes precedence.
+ if any(rn>prm and any(re.search(r"\bTarget\s+Values\s*\(",str(v),re.I)
+                        for v in row.values())
+        for rn,row in section):return []
+ vals={}
+ for rn,row in section:
+  if rn<=prm:continue
+  key=str(row.get(namecol,"")).strip()
+  typ=str(row.get(typecol,"")).strip().lower()
+  if not re.search(r"\b(?:key\s+leaf|leaf|leaf-list)\b",typ):continue
+  if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.:-]*(?:\s*/\s*[A-Za-z][A-Za-z0-9_.:-]*)*",key):continue
+  raw=row.get(targetcol)
+  if isinstance(raw,str) and re.match(
+      r"(?i)^\s*(?:refer\s+to\b|see\s+value\s+below\b)",raw):continue
+  value=normalize(raw)
+  if value is None:continue
+  norm=clean_name(re.sub(r"\s*/\s*","/",key))
+  if norm in vals and vals[norm]!=value:
+   raise ValueError(f"Conflicting inline value for {norm} on row {rn}")
+  vals[norm]=value
+ return [vals] if vals else []
+
+
 def convert_sheet(name,rows):
  """Prefer verified target blocks over fallback/description-matrix placeholders."""
  # For standalone sheets, reject a duplicated Current Values grid and extract
@@ -641,6 +683,14 @@ def convert_sheet(name,rows):
     if has_horizontal_header:break
    if has_horizontal_header and not any(any(re.search(r"\bRefer\s+to\s+.+?\s+sheet\b",str(v),re.I) for v in r.values()) for _,r in section):
     suppress_legacy.add((path,start))
+    continue
+   inline=find_inline_parameter_targets(section,prm)
+   if inline:
+    recs=inline
+    ident=(path,start)
+    replacement=(clean_name(path.rstrip('/').split('/')[-1]),recs,path,start)
+    if ident in old_map:replacements[old_map[ident]]=replacement
+    else:new.append(replacement)
     continue
    tables=find_vertical_target_values(section,prm)
    if not tables:
